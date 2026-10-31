@@ -1,0 +1,1292 @@
+// save_sticker.ts - 贴纸收藏插件
+// 保存别人或自己发的贴纸到指定贴纸包
+// 支持批量模式：每次start生成新贴纸包，连续发送图片自动转贴纸并保存
+import { Plugin } from "@utils/pluginBase";
+import { getPrefixes } from "@utils/pluginManager";
+import { createDirectoryInAssets, createDirectoryInTemp } from "@utils/pathHelpers";
+import { Api } from "teleproto";
+import { CustomFile } from "teleproto/client/uploads";
+import sharp from "sharp";
+import * as fs from "fs";
+import * as path from "path";
+import * as crypto from "crypto";
+import { execFile } from "child_process";
+
+// 获取命令前缀
+const prefixes = getPrefixes();
+const mainPrefix = prefixes[0];
+const pluginName = "save_sticker";
+const commandName = `${mainPrefix}${pluginName}`;
+const shortCommandName = `${mainPrefix}ss`;
+
+// HTML转义
+const htmlEscape = (text: string): string =>
+  text.replace(/[&<>\"']/g, m => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;',
+    '"': '&quot;', "'": '&#x27;'
+  }[m] || m));
+
+
+const isImageDocument = (document: Api.Document): boolean => {
+  if ((document.mimeType || "").startsWith("image/")) return true;
+  const fileName = document.attributes
+    ?.find((attr) => attr instanceof Api.DocumentAttributeFilename)
+    ?.fileName || "";
+  return /\.(?:jpe?g|png|webp|gif|bmp|tiff?|avif|heic|heif)$/i.test(fileName);
+};
+
+// ===== 视频贴纸（webm）处理 =====
+// Telegram 对视频贴纸有时长限制，超出会返回 STICKER_VIDEO_LONG，
+// 这里统一做“超长自动压缩 + 逐级重试”，避免直接保存失败。
+const VIDEO_STICKER_LIMIT_SEC = 3;    // 官方上限：普通账号视频贴纸 ≤ 3 秒
+const VIDEO_STICKER_TARGET_SEC = 2.7; // 自动压缩的目标时长（留余量，避免边界被拒）
+const VIDEO_STICKER_SIDE = 512;       // 视频贴纸要求 512×512
+
+const toInputDocument = (doc: Api.Document): Api.InputDocument =>
+  new Api.InputDocument({
+    id: doc.id,
+    accessHash: doc.accessHash,
+    fileReference: doc.fileReference || Buffer.from([]),
+  });
+
+// 是否带贴纸属性
+const hasStickerAttribute = (doc: Api.Document): boolean =>
+  !!doc.attributes?.some((attr) => attr instanceof Api.DocumentAttributeSticker);
+
+// 是否为视频贴纸（webm）
+const isVideoSticker = (doc: Api.Document): boolean => {
+  if (!hasStickerAttribute(doc)) return false;
+  if ((doc.mimeType || "").toLowerCase().includes("webm")) return true;
+  return !!doc.attributes?.some((attr) => attr instanceof Api.DocumentAttributeVideo);
+};
+
+// 取视频时长（毫秒），取不到返回 0
+const getVideoDurationMs = (doc: Api.Document): number => {
+  const attr = doc.attributes?.find(
+    (a) => a instanceof Api.DocumentAttributeVideo
+  ) as Api.DocumentAttributeVideo | undefined;
+  const d = attr?.duration;
+  return typeof d === "number" && d > 0 ? Math.round(d * 1000) : 0;
+};
+
+const execFileAsync = (
+  cmd: string,
+  args: string[],
+  timeout = 120000
+): Promise<void> =>
+  new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout, maxBuffer: 16 * 1024 * 1024 }, (err) =>
+      err ? reject(err) : resolve()
+    );
+  });
+
+// 把 Telegram 报错翻译成人话
+const describeStickerError = (error: any): string => {
+  const code = error?.errorMessage || "";
+  const map: Record<string, string> = {
+    STICKER_VIDEO_LONG: `视频贴纸超过 ${VIDEO_STICKER_LIMIT_SEC} 秒上限（已尝试自动压缩）`,
+    STICKER_VIDEO_WEBM_INVALID: "视频贴纸必须是 512×512 的 VP9 webm",
+    STICKER_IMAGE_DIMENSIONS: "图片尺寸不合法，无法保存为贴纸",
+    STICKER_PNG_DIMENSIONS: "PNG 贴纸必须是 512×512",
+    STICKER_ANIMATION_INVALID: "动态贴纸格式不合法",
+    STICKER_FILE_INVALID: "贴纸文件无效",
+    STICKER_INVALID: "贴纸无效",
+    STICKERS_TOO_MUCH: "贴纸包已满（最多 120 个贴纸）",
+    STICKERSET_INVALID: "贴纸包名称无效或不存在",
+    STICKERSET_ALREADY_EXISTS: "贴纸包名称已被占用",
+    STICKERSET_NOT_MODIFIED: "贴纸包没有变化",
+  };
+  if (map[code]) return `❌ ${map[code]}`;
+  return error?.message ? `❌ 保存失败: ${error.message}` : "❌ 保存失败";
+};
+
+// 帮助文档
+const help_text = `📌 <b>贴纸收藏插件</b>
+
+<b>📝 功能：</b>
+• 保存别人或自己发的贴纸到贴纸包
+• 自动创建贴纸包（首次使用）
+• 支持自定义贴纸包名称
+• <b>批量模式</b>：可创建新贴纸包，也可使用固定贴纸包
+
+<b>🔧 使用：</b>
+• <code>${shortCommandName}</code> - 回复贴纸/图片，保存到<b>固定贴纸包</b>
+• <code>${shortCommandName} start</code> - 开始批量收集（需回复第一张贴纸/图片）
+• <code>${shortCommandName} start fixed</code> - 使用固定贴纸包开始批量收集
+• <code>${shortCommandName} start &lt;ID&gt;</code> - 开始批量收集（添加到指定贴纸包）
+• <code>${shortCommandName} stop</code> - 结束批量收集
+• <code>${shortCommandName} set &lt;名称&gt;</code> - 设置<b>固定贴纸包</b>名称
+• <code>${shortCommandName} show</code> - 查看当前配置
+• <code>${shortCommandName} reset</code> - 重置固定贴纸包
+• <code>${shortCommandName} help</code> - 显示帮助
+
+<b>💡 两种模式：</b>
+
+<b>1️⃣ 单次保存模式：</b>
+• 回复贴纸或图片后发送 <code>${shortCommandName}</code>
+• 保存到固定贴纸包（可自定义名称）
+• 图片会自动转换为贴纸格式
+
+<b>2️⃣ 批量收集模式：</b>
+1. 回复一个贴纸/图片，发送 <code>${shortCommandName} start</code>（创建新贴纸包）
+2. 连续发送图片或贴纸（自动保存到贴纸包）
+3. 发送 <code>${shortCommandName} stop</code> 结束
+
+或添加到已有贴纸包：
+1. 发送 <code>${shortCommandName} start fixed</code> 使用固定贴纸包，或发送 <code>${shortCommandName} start &lt;ID&gt;</code>
+2. 连续发送图片或贴纸
+3. 发送 <code>${shortCommandName} stop</code> 结束
+
+<b>📌 说明：</b>
+• 固定贴纸包：持久保存，除非手动重置
+• 批量模式：默认创建新贴纸包，使用 fixed 则保存到固定贴纸包
+• 贴纸包名称只能包含字母、数字和下划线
+• 图片会自动转换为512x512的webp贴纸格式`;
+
+// 配置接口
+interface SaveStickerConfig {
+  stickerSetShortName: string;  // 固定贴纸包名称（单次保存模式）
+  autoGenerated: boolean;
+}
+
+// 批量收集会话状态
+interface BatchSession {
+  active: boolean;
+  chatId: string;
+  startTime: number;
+  count: number;
+  stickerSetShortName: string;  // 批量模式专用贴纸包名称
+}
+
+class SaveStickerPlugin extends Plugin {
+  cleanup(): void {
+    // 清理所有活跃会话
+    this.batchSessions.clear();
+  }
+
+  description: string = help_text;
+  private configPath: string;
+  private config: SaveStickerConfig;
+  private assetsDir: string;
+  private tempDir: string;
+  
+  // 批量收集会话管理
+  private batchSessions: Map<string, BatchSession> = new Map();
+  // 处理队列（防止并发）
+  private processingQueues: Map<string, Promise<void>> = new Map();
+  // 插件内部为了转换图片而临时发出的贴纸消息，必须跳过监听，避免一张图片被计数两次
+  private ignoredMessageIds: Set<string> = new Set();
+  // 已经进入处理流程的用户消息，防止运行时重复派发同一条媒体消息
+  private processingMessageIds: Set<string> = new Set();
+
+  cmdHandlers: Record<string, (msg: Api.Message, trigger?: Api.Message) => Promise<void>> = {
+    "save_sticker": this.handleCommand.bind(this),
+    "ss": this.handleCommand.bind(this),
+  };
+
+  // 监听消息处理器（用于批量模式）
+  listenMessageHandler?: (msg: Api.Message, options?: { isEdited?: boolean }) => Promise<void>;
+  listenMessageHandlerIgnoreEdited: boolean = true;
+
+  constructor() {
+    super();
+    this.assetsDir = createDirectoryInAssets("save_sticker");
+    this.tempDir = createDirectoryInTemp("save_sticker");
+    this.configPath = path.join(this.assetsDir, "config.json");
+    this.config = {
+      stickerSetShortName: "",
+      autoGenerated: false,
+    };
+    this.loadConfig();
+    
+    // 设置消息监听器
+    this.listenMessageHandler = this.handleListenMessage.bind(this);
+  }
+
+  private loadConfig() {
+    try {
+      if (fs.existsSync(this.configPath)) {
+        const data = fs.readFileSync(this.configPath, "utf-8");
+        this.config = JSON.parse(data);
+      } else {
+        this.saveConfig();
+      }
+    } catch (error) {
+      console.error("[save_sticker] 加载配置失败:", error);
+    }
+  }
+
+  private saveConfig() {
+    try {
+      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), "utf-8");
+    } catch (error) {
+      console.error("[save_sticker] 保存配置失败:", error);
+    }
+  }
+
+  // 生成8位随机ID
+  private generateShortId(): string {
+    return crypto.randomBytes(4).toString("hex");
+  }
+
+  // ===== 视频贴纸处理 =====
+  // 用 ffmpeg 压缩为合规的 VP9 webm（512×512、保留透明通道、限制时长）
+  private async transcodeVideoSticker(input: Buffer, maxSeconds: number): Promise<Buffer> {
+    const tag = crypto.randomBytes(4).toString("hex");
+    const inPath = path.join(this.tempDir, `vs_in_${tag}.webm`);
+    const outPath = path.join(this.tempDir, `vs_out_${tag}.webm`);
+    try {
+      fs.writeFileSync(inPath, input);
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-loglevel", "error",
+        "-i", inPath,
+        "-t", maxSeconds.toFixed(2),
+        "-vf",
+        `scale=${VIDEO_STICKER_SIDE}:${VIDEO_STICKER_SIDE}:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30`,
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-crf", "32",
+        "-b:v", "0",
+        "-an",
+        "-f", "webm",
+        outPath,
+      ]);
+      const out = fs.readFileSync(outPath);
+      if (!out.length) throw new Error("视频压缩输出为空");
+      return out;
+    } finally {
+      try { fs.unlinkSync(inPath); } catch (e) {}
+      try { fs.unlinkSync(outPath); } catch (e) {}
+    }
+  }
+
+  // 把压缩后的 webm 以“贴纸消息”形式发到聊天里，换取可用于 AddStickerToSet 的 document
+  private async uploadVideoSticker(
+    client: any,
+    peerId: any,
+    buffer: Buffer,
+    durationSec: number
+  ): Promise<{ document: Api.InputDocument; sentMsg: Api.Message }> {
+    const sentMsg = await client.sendFile(peerId, {
+      workers: 1,
+      file: new CustomFile("sticker.webm", buffer.length, "", buffer),
+      attributes: [
+        new Api.DocumentAttributeSticker({
+          alt: "⭐",
+          stickerset: new Api.InputStickerSetEmpty()
+        }),
+        new Api.DocumentAttributeVideo({
+          duration: durationSec,
+          w: VIDEO_STICKER_SIDE,
+          h: VIDEO_STICKER_SIDE,
+          supportsStreaming: true
+        }),
+        new Api.DocumentAttributeFilename({ fileName: "sticker.webm" }),
+      ],
+      forceDocument: false,
+    });
+
+    this.ignoreInternalMessage(sentMsg);
+    if (!sentMsg || !(sentMsg.media instanceof Api.MessageMediaDocument)) {
+      throw new Error("上传视频贴纸失败");
+    }
+    return {
+      document: toInputDocument(sentMsg.media.document as Api.Document),
+      sentMsg,
+    };
+  }
+
+  // 候选方案：0 表示直接使用原文档，其余为压缩到的时长（秒）
+  private buildVideoStickerCandidates(doc: Api.Document): number[] {
+    if (!isVideoSticker(doc)) return [0];
+    const durationMs = getVideoDurationMs(doc);
+    // 时长未知：先原样试一次，失败再压缩
+    if (durationMs <= 0) return [0, VIDEO_STICKER_TARGET_SEC, 2.0, 1.5, 1.0];
+    if (durationMs <= VIDEO_STICKER_LIMIT_SEC * 1000) return [0];
+    return [VIDEO_STICKER_TARGET_SEC, 2.0, 1.5, 1.0];
+  }
+
+  // 生成可用于 AddStickerToSet / CreateStickerSet 的 document（必要时自动压缩视频贴纸）
+  private async resolveStickerDocument(
+    client: any,
+    peerId: any,
+    doc: Api.Document,
+    candidates: number[],
+    rawCache: { buffer?: Buffer }
+  ): Promise<{ document: Api.InputDocument; sentMsg?: Api.Message }> {
+    for (const limit of candidates) {
+      if (limit === 0) return { document: toInputDocument(doc) };
+
+      if (!rawCache.buffer) {
+        const raw = await client.downloadMedia(doc);
+        if (!Buffer.isBuffer(raw)) throw new Error("下载视频贴纸失败");
+        rawCache.buffer = raw;
+      }
+      const compressed = await this.transcodeVideoSticker(rawCache.buffer, limit);
+      return await this.uploadVideoSticker(client, peerId, compressed, limit);
+    }
+    throw new Error("没有可用的贴纸方案");
+  }
+
+  // 添加到贴纸包（视频贴纸超长自动压缩并逐级重试）
+  private async invokeAddSticker(
+    client: any,
+    peerId: any,
+    shortName: string,
+    doc: Api.Document,
+    emoji = "⭐"
+  ): Promise<void> {
+    const candidates = this.buildVideoStickerCandidates(doc);
+    const rawCache: { buffer?: Buffer } = {};
+    let lastError: any = null;
+
+    for (const limit of candidates) {
+      let sentMsg: Api.Message | undefined;
+      try {
+        const prepared = await this.resolveStickerDocument(client, peerId, doc, [limit], rawCache);
+        sentMsg = prepared.sentMsg;
+        await client.invoke(new Api.stickers.AddStickerToSet({
+          stickerset: new Api.InputStickerSetShortName({ shortName }),
+          sticker: new Api.InputStickerSetItem({
+            document: prepared.document,
+            emoji
+          }),
+        }));
+        if (sentMsg) { try { await sentMsg.delete(); } catch (e) {} }
+        return;
+      } catch (error: any) {
+        lastError = error;
+        if (sentMsg) { try { await sentMsg.delete(); } catch (e) {} }
+        if (error?.errorMessage !== "STICKER_VIDEO_LONG") throw error;
+      }
+    }
+    throw lastError || new Error("STICKER_VIDEO_LONG");
+  }
+
+  // 创建贴纸包（首个视频贴纸超长时同样自动压缩重试）
+  private async invokeCreateStickerSet(
+    client: any,
+    peerId: any,
+    userId: any,
+    title: string,
+    shortName: string,
+    doc: Api.Document,
+    emoji = "⭐"
+  ): Promise<void> {
+    const candidates = this.buildVideoStickerCandidates(doc);
+    const rawCache: { buffer?: Buffer } = {};
+    let lastError: any = null;
+
+    for (const limit of candidates) {
+      let sentMsg: Api.Message | undefined;
+      try {
+        const prepared = await this.resolveStickerDocument(client, peerId, doc, [limit], rawCache);
+        sentMsg = prepared.sentMsg;
+        await client.invoke(new Api.stickers.CreateStickerSet({
+          userId,
+          title,
+          shortName,
+          stickers: [new Api.InputStickerSetItem({
+            document: prepared.document,
+            emoji
+          })],
+        }));
+        if (sentMsg) { try { await sentMsg.delete(); } catch (e) {} }
+        return;
+      } catch (error: any) {
+        lastError = error;
+        if (sentMsg) { try { await sentMsg.delete(); } catch (e) {} }
+        if (error?.errorMessage === "STICKERSET_ALREADY_EXISTS") throw error;
+      }
+    }
+    throw lastError || new Error("创建贴纸包失败");
+  }
+
+  // 确保有固定贴纸包名称，如果没有则自动生成
+  private ensureStickerSetName(): string {
+    if (!this.config.stickerSetShortName) {
+      const newId = this.generateShortId();
+      this.config.stickerSetShortName = `tb_${newId}`;
+      this.config.autoGenerated = true;
+      this.saveConfig();
+      console.log(`[save_sticker] 自动生成固定贴纸包名称: ${this.config.stickerSetShortName}`);
+    }
+    return this.config.stickerSetShortName;
+  }
+
+  // 获取会话ID
+  private getSessionId(msg: Api.Message): string {
+    const chatId = msg.peerId?.toString() || "unknown";
+    const userId = msg.senderId?.toString() || "0";
+    return `${chatId}_${userId}`;
+  }
+
+  private getMessageDedupeKey(msg: Api.Message): string {
+    return `${msg.peerId?.toString() || "unknown"}_${msg.id}`;
+  }
+
+  private ignoreInternalMessage(msg: Api.Message | undefined | null): void {
+    if (!msg) return;
+    const key = this.getMessageDedupeKey(msg);
+    this.ignoredMessageIds.add(key);
+    setTimeout(() => this.ignoredMessageIds.delete(key), 5 * 60 * 1000);
+  }
+
+  // 主命令处理器
+  private async handleCommand(msg: Api.Message, trigger?: Api.Message): Promise<void> {
+    const client = msg.client;
+    if (!client) {
+      await msg.edit({ text: "❌ 客户端未初始化", parseMode: "html" });
+      return;
+    }
+
+    // 参数解析
+    const lines = msg.text?.trim()?.split(/\r?\n/g) || [];
+    const parts = lines?.[0]?.split(/\s+/) || [];
+    const [, ...args] = parts;
+    const sub = (args[0] || "").toLowerCase();
+
+    try {
+      // 帮助命令
+      if (sub === "help" || sub === "h") {
+        await msg.edit({ text: help_text, parseMode: "html" });
+        return;
+      }
+
+      // 设置固定贴纸包名称
+      if (sub === "set") {
+        await this.handleSetStickerName(msg, args.slice(1));
+        return;
+      }
+
+      // 显示当前配置
+      if (sub === "show" || sub === "config") {
+        await this.handleShowConfig(msg);
+        return;
+      }
+
+      // 重置固定贴纸包
+      if (sub === "reset") {
+        this.config.stickerSetShortName = "";
+        this.config.autoGenerated = false;
+        this.saveConfig();
+        await msg.edit({
+          text: "✅ 已重置固定贴纸包配置，下次保存时将自动生成新的贴纸包",
+          parseMode: "html"
+        });
+        return;
+      }
+
+      // 批量模式：开始
+      if (sub === "start") {
+        await this.handleBatchStart(msg, client, args.slice(1));
+        return;
+      }
+
+      // 批量模式：停止
+      if (sub === "stop") {
+        await this.handleBatchStop(msg);
+        return;
+      }
+
+      // 保存贴纸到固定贴纸包（主功能）
+      await this.handleSaveStickerAction(msg, client);
+
+    } catch (error: any) {
+      console.error("[save_sticker] 插件执行失败:", error);
+      await msg.edit({
+        text: `❌ <b>操作失败:</b> ${htmlEscape(error.message || "未知错误")}`,
+        parseMode: "html"
+      });
+    }
+  }
+
+  private async handleSetStickerName(msg: Api.Message, args: string[]): Promise<void> {
+    const newName = args.join("_").replace(/[^a-zA-Z0-9_]/g, "");
+    
+    if (!newName) {
+      await msg.edit({
+        text: `❌ 请提供贴纸包名称\n\n用法: <code>${shortCommandName} set &lt;名称&gt;</code>\n名称只能包含字母、数字和下划线`,
+        parseMode: "html"
+      });
+      return;
+    }
+
+    if (newName.length < 3 || newName.length > 64) {
+      await msg.edit({
+        text: "❌ 贴纸包名称长度必须在3-64个字符之间",
+        parseMode: "html"
+      });
+      return;
+    }
+
+    this.config.stickerSetShortName = newName;
+    this.config.autoGenerated = false;
+    this.saveConfig();
+
+    await msg.edit({
+      text: `✅ <b>固定贴纸包</b>名称已设置为: <code>${htmlEscape(newName)}</code>\n\n🔗 链接: t.me/addstickers/${htmlEscape(newName)}`,
+      parseMode: "html"
+    });
+  }
+
+  private async handleShowConfig(msg: Api.Message): Promise<void> {
+    const currentName = this.config.stickerSetShortName || "未设置（首次保存时自动生成）";
+    const isAuto = this.config.autoGenerated ? "（自动生成）" : "";
+    const sessionId = this.getSessionId(msg);
+    const session = this.batchSessions.get(sessionId);
+    
+    let batchInfo = "";
+    if (session?.active) {
+      batchInfo = `\n\n🔄 <b>批量收集模式:</b> 进行中\n` +
+        `• 贴纸包: <code>${htmlEscape(session.stickerSetShortName)}</code>\n` +
+        `• 已收集: ${session.count} 个\n` +
+        `• 链接: t.me/addstickers/${htmlEscape(session.stickerSetShortName)}`;
+    }
+    
+    await msg.edit({
+      text: `📌 <b>贴纸收藏配置</b>\n\n` +
+        `<b>固定贴纸包:</b> <code>${htmlEscape(currentName)}</code> ${isAuto}${batchInfo}\n\n` +
+        `💡 使用 <code>${shortCommandName} set &lt;名称&gt;</code> 修改固定贴纸包`,
+      parseMode: "html"
+    });
+  }
+
+  // 批量模式：开始
+  private async handleBatchStart(msg: Api.Message, client: any, args: string[]): Promise<void> {
+    const sessionId = this.getSessionId(msg);
+    
+    // 检查是否已有活跃会话
+    if (this.batchSessions.has(sessionId) && this.batchSessions.get(sessionId)?.active) {
+      const existingSession = this.batchSessions.get(sessionId)!;
+      await msg.edit({
+        text: `⚠️ 批量收集模式已在进行中\n\n` +
+          `📦 贴纸包: <code>${htmlEscape(existingSession.stickerSetShortName)}</code>\n` +
+          `📊 已收集: ${existingSession.count} 个\n\n` +
+          `发送图片或贴纸即可自动保存，或发送 <code>.ss stop</code> 结束`,
+        parseMode: "html"
+      });
+      return;
+    }
+
+    // 获取回复的消息（如果有）
+    let replyMsg: Api.Message | null = null;
+    if (msg.replyTo && 'replyToMsgId' in msg.replyTo && msg.replyTo.replyToMsgId) {
+      try {
+        const replyMsgId = msg.replyTo.replyToMsgId;
+        const messages = await client.getMessages(msg.peerId!, {
+          ids: [replyMsgId]
+        });
+        if (messages && messages.length > 0) {
+          replyMsg = messages[0];
+        }
+      } catch (error) {
+        console.error("[save_sticker] 获取回复消息失败:", error);
+      }
+    }
+
+    // 检查是否指定了固定贴纸包或贴纸包ID
+    let batchStickerSetName = "";
+    let isUsingExisting = false;
+    const requestedSet = (args[0] || "").trim();
+    const useFixedSet = ["fixed", "固定"].includes(requestedSet.toLowerCase());
+    
+    if (useFixedSet) {
+      batchStickerSetName = this.ensureStickerSetName();
+      try {
+        const stickerSet = await client.invoke(new Api.messages.GetStickerSet({
+          stickerset: new Api.InputStickerSetShortName({ shortName: batchStickerSetName }),
+          hash: 0,
+        }));
+        if (stickerSet instanceof Api.messages.StickerSet) {
+          isUsingExisting = true;
+        }
+      } catch (error: any) {
+        if (error.errorMessage !== "STICKERSET_INVALID") {
+          throw error;
+        }
+        // 固定贴纸包尚未创建时，可通过回复第一张贴纸/图片创建
+      }
+
+      if (!isUsingExisting && (!replyMsg || !replyMsg.media)) {
+        await msg.edit({
+          text: `❌ 固定贴纸包尚未创建，请回复一个贴纸或图片后发送 <code>${shortCommandName} start fixed</code>`,
+          parseMode: "html"
+        });
+        return;
+      }
+    } else if (args.length > 0 && args[0]) {
+      // 使用指定的贴纸包ID
+      batchStickerSetName = args[0].replace(/[^a-zA-Z0-9_]/g, "");
+      if (batchStickerSetName.length < 3 || batchStickerSetName.length > 64) {
+        await msg.edit({
+          text: "❌ 贴纸包名称长度必须在3-64个字符之间",
+          parseMode: "html"
+        });
+        return;
+      }
+      
+      // 检查贴纸包是否存在
+      try {
+        const stickerSet = await client.invoke(new Api.messages.GetStickerSet({
+          stickerset: new Api.InputStickerSetShortName({ shortName: batchStickerSetName }),
+          hash: 0,
+        }));
+        if (stickerSet instanceof Api.messages.StickerSet) {
+          isUsingExisting = true;
+        }
+      } catch (error: any) {
+        if (error.errorMessage === "STICKERSET_INVALID") {
+          await msg.edit({
+            text: `❌ 贴纸包 <code>${htmlEscape(batchStickerSetName)}</code> 不存在`,
+            parseMode: "html"
+          });
+          return;
+        }
+        throw error;
+      }
+    } else {
+      // 没有指定贴纸包ID，需要回复贴纸/图片来创建新贴纸包
+      if (!replyMsg || !replyMsg.media) {
+        await msg.edit({
+          text: `❌ 请回复一个贴纸或图片来创建新贴纸包\n\n` +
+            `用法: <code>${shortCommandName} start</code>（回复贴纸/图片）\n` +
+            `或: <code>${shortCommandName} start &lt;ID&gt;</code>（添加到指定贴纸包）`,
+          parseMode: "html"
+        });
+        return;
+      }
+      
+      // 生成新的贴纸包名称
+      batchStickerSetName = `tb_batch_${this.generateShortId()}`;
+    }
+
+    // 获取回复的媒体信息
+    let isReplySticker = false;
+    let isReplyPhoto = false;
+    let replyDocument: Api.Document | null = null;
+    
+    if (replyMsg?.media) {
+      if (replyMsg.media instanceof Api.MessageMediaDocument) {
+        const doc = replyMsg.media.document;
+        if (doc instanceof Api.Document) {
+          isReplySticker = doc.attributes?.some(attr =>
+            attr instanceof Api.DocumentAttributeSticker
+          ) || false;
+          if (isReplySticker) {
+            replyDocument = doc;
+          } else {
+            isReplyPhoto = isImageDocument(doc);
+          }
+        }
+      } else if (replyMsg.media instanceof Api.MessageMediaPhoto) {
+        isReplyPhoto = true;
+      }
+    }
+
+    // 如果是创建新贴纸包，需要有回复的媒体
+    if (!isUsingExisting) {
+      if (!isReplySticker && !isReplyPhoto) {
+        await msg.edit({
+          text: `❌ 回复的内容不是贴纸或图片\n\n请回复一个贴纸或图片来创建新贴纸包`,
+          parseMode: "html"
+        });
+        return;
+      }
+
+      await msg.edit({ text: "⏳ 正在创建新贴纸包...", parseMode: "html" });
+      
+      try {
+        let firstSticker: any = null;
+        let firstStickerSource: Api.Document | null = null;
+
+        if (isReplySticker && replyDocument) {
+          // 贴纸：交给 invokeCreateStickerSet 处理（视频贴纸超长会自动压缩）
+          firstStickerSource = replyDocument;
+        } else if (isReplyPhoto && replyMsg) {
+          // 图片：下载并转换
+          const buffer = await replyMsg.downloadMedia();
+          if (!Buffer.isBuffer(buffer)) {
+            throw new Error("下载图片失败");
+          }
+          
+          const stickerBuffer = await sharp(buffer)
+            .resize(512, 512, {
+              fit: 'contain',
+              background: { r: 0, g: 0, b: 0, alpha: 0 }
+            })
+            .webp({ quality: 90 })
+            .toBuffer();
+
+          // 先发送贴纸到聊天，获取document
+          const sentMsg = await client.sendFile(msg.peerId!, {
+          workers: 1,
+            file: new CustomFile("sticker.webp", stickerBuffer.length, "", stickerBuffer),
+            attributes: [
+              new Api.DocumentAttributeSticker({
+                alt: "⭐",
+                stickerset: new Api.InputStickerSetEmpty()
+              }),
+              new Api.DocumentAttributeFilename({ fileName: "sticker.webp" })
+            ],
+            forceDocument: false,
+          });
+
+          // 从发送的消息中获取document
+          this.ignoreInternalMessage(sentMsg);
+          if (sentMsg && sentMsg.media instanceof Api.MessageMediaDocument) {
+            const doc = sentMsg.media.document as Api.Document;
+            firstSticker = new Api.InputDocument({
+              id: doc.id,
+              accessHash: doc.accessHash,
+              fileReference: doc.fileReference || Buffer.from([]),
+            });
+            
+            // 删除发送的临时消息
+            try {
+              await sentMsg.delete();
+            } catch (e) {}
+          } else {
+            throw new Error("发送贴纸失败");
+          }
+        }
+
+        const me = await client.getMe();
+        if (firstStickerSource) {
+          await this.invokeCreateStickerSet(
+            client, msg.peerId!, me,
+            batchStickerSetName, batchStickerSetName, firstStickerSource
+          );
+        } else {
+          await client.invoke(new Api.stickers.CreateStickerSet({
+            userId: me,
+            title: batchStickerSetName,
+            shortName: batchStickerSetName,
+            stickers: [new Api.InputStickerSetItem({
+              document: firstSticker,
+              emoji: "⭐"
+            })],
+          }));
+        }
+      } catch (createError: any) {
+        console.error("[save_sticker] 创建贴纸包失败:", createError);
+        await msg.edit({
+          text: describeStickerError(createError),
+          parseMode: "html"
+        });
+        return;
+      }
+    } else if (replyMsg?.media && (isReplySticker || isReplyPhoto)) {
+      // 指定了已有贴纸包，并且回复了媒体，先添加第一个
+      await msg.edit({ text: "⏳ 正在添加到贴纸包...", parseMode: "html" });
+      
+      try {
+        if (isReplySticker && replyDocument) {
+          // 视频贴纸超长会自动压缩后重试
+          await this.invokeAddSticker(
+            client, msg.peerId!, batchStickerSetName, replyDocument
+          );
+        } else if (isReplyPhoto && replyMsg) {
+          const buffer = await replyMsg.downloadMedia();
+          if (!Buffer.isBuffer(buffer)) {
+            throw new Error("下载图片失败");
+          }
+          
+          const stickerBuffer = await sharp(buffer)
+            .resize(512, 512, {
+              fit: 'contain',
+              background: { r: 0, g: 0, b: 0, alpha: 0 }
+            })
+            .webp({ quality: 90 })
+            .toBuffer();
+
+          // 先发送贴纸到聊天，获取document
+          const sentMsg = await client.sendFile(msg.peerId!, {
+          workers: 1,
+            file: new CustomFile("sticker.webp", stickerBuffer.length, "", stickerBuffer),
+            attributes: [
+              new Api.DocumentAttributeSticker({
+                alt: "⭐",
+                stickerset: new Api.InputStickerSetEmpty()
+              }),
+              new Api.DocumentAttributeFilename({ fileName: "sticker.webp" })
+            ],
+            forceDocument: false,
+          });
+
+          // 从发送的消息中获取document
+          this.ignoreInternalMessage(sentMsg);
+          if (sentMsg && sentMsg.media instanceof Api.MessageMediaDocument) {
+            const doc = sentMsg.media.document as Api.Document;
+            const documentToAdd = new Api.InputDocument({
+              id: doc.id,
+              accessHash: doc.accessHash,
+              fileReference: doc.fileReference || Buffer.from([]),
+            });
+
+            await client.invoke(new Api.stickers.AddStickerToSet({
+              stickerset: new Api.InputStickerSetShortName({ shortName: batchStickerSetName }),
+              sticker: new Api.InputStickerSetItem({
+                document: documentToAdd,
+                emoji: "⭐"
+              }),
+            }));
+            
+            // 删除发送的临时消息
+            try {
+              await sentMsg.delete();
+            } catch (e) {}
+          } else {
+            throw new Error("发送贴纸失败");
+          }
+        }
+      } catch (addError: any) {
+        console.error("[save_sticker] 添加到贴纸包失败:", addError);
+        await msg.edit({
+          text: describeStickerError(addError),
+          parseMode: "html"
+        });
+        return;
+      }
+    }
+
+    // 创建批量收集会话
+    const initialCount = (isUsingExisting && replyMsg?.media && (isReplySticker || isReplyPhoto)) ? 1 : (isUsingExisting ? 0 : 1);
+    
+    this.batchSessions.set(sessionId, {
+      active: true,
+      chatId: msg.peerId?.toString() || "",
+      startTime: Date.now(),
+      count: initialCount,
+      stickerSetShortName: batchStickerSetName,
+    });
+
+    const statusText = isUsingExisting ? "已连接到现有贴纸包" : "新贴纸包已创建";
+    const firstItemText = initialCount > 0 ? `\n✅ 第一个贴纸已保存` : "";
+    
+    await msg.edit({
+      text: `🎯 <b>批量收集模式已开启</b>\n\n` +
+        `📦 <b>${statusText}:</b> <code>${htmlEscape(batchStickerSetName)}</code>\n` +
+        `🔗 <b>链接:</b> t.me/addstickers/${htmlEscape(batchStickerSetName)}${firstItemText}\n\n` +
+        `📸 <b>现在请发送图片或贴纸</b>（会自动保存到贴纸包）\n\n` +
+        `⏹️ 发送 <code>${shortCommandName} stop</code> 结束收集`,
+      parseMode: "html"
+    });
+  }
+
+  // 批量模式：停止
+  private async handleBatchStop(msg: Api.Message): Promise<void> {
+    const sessionId = this.getSessionId(msg);
+    const session = this.batchSessions.get(sessionId);
+    
+    if (!session || !session.active) {
+      await msg.edit({
+        text: "❌ 批量收集模式未开启\n\n使用 <code>.ss start</code> 开始",
+        parseMode: "html"
+      });
+      return;
+    }
+
+    const duration = Math.floor((Date.now() - session.startTime) / 1000);
+    const stickerSetName = session.stickerSetShortName;
+    
+    // 移除会话
+    this.batchSessions.delete(sessionId);
+
+    await msg.edit({
+      text: `✅ <b>批量收集已结束</b>\n\n` +
+        `📊 <b>统计:</b>\n` +
+        `• 收集贴纸: ${session.count} 个\n` +
+        `• 用时: ${duration} 秒\n\n` +
+        `📦 <b>贴纸包:</b> <code>${htmlEscape(stickerSetName)}</code>\n` +
+        `🔗 <b>链接:</b> t.me/addstickers/${htmlEscape(stickerSetName)}`,
+      parseMode: "html"
+    });
+  }
+
+  // 监听消息处理器（批量模式）
+  private async handleListenMessage(msg: Api.Message, options?: { isEdited?: boolean }): Promise<void> {
+    // 忽略编辑的消息
+    if (options?.isEdited) return;
+    
+    // 检查是否是自己的消息
+    if (!msg.out) return;
+    
+    // 忽略插件内部为了转图片而临时发出的贴纸消息，避免重复保存/重复计数
+    const dedupeKey = this.getMessageDedupeKey(msg);
+    if (this.ignoredMessageIds.has(dedupeKey)) {
+      this.ignoredMessageIds.delete(dedupeKey);
+      return;
+    }
+    
+    const sessionId = this.getSessionId(msg);
+    const session = this.batchSessions.get(sessionId);
+    
+    // 检查是否有活跃的批量会话
+    if (!session || !session.active) return;
+    
+    // 检查是否有媒体
+    if (!msg.media) return;
+    
+    // 判断是图片还是贴纸
+    let isPhoto = false;
+    let isSticker = false;
+    
+    if (msg.media instanceof Api.MessageMediaPhoto) {
+      isPhoto = true;
+    } else if (msg.media instanceof Api.MessageMediaDocument) {
+      const document = msg.media.document;
+      if (document instanceof Api.Document) {
+        isSticker = document.attributes?.some(attr =>
+          attr instanceof Api.DocumentAttributeSticker
+        ) || false;
+        if (!isSticker) isPhoto = isImageDocument(document);
+      }
+    }
+    
+    // 如果既不是图片也不是贴纸，忽略
+    if (!isPhoto && !isSticker) return;
+
+    if (this.processingMessageIds.has(dedupeKey)) return;
+    this.processingMessageIds.add(dedupeKey);
+    setTimeout(() => this.processingMessageIds.delete(dedupeKey), 10 * 60 * 1000);
+    
+    // 使用队列串行处理，防止并发
+    const queueKey = sessionId;
+    const processTask = async () => {
+      // 等待前一个任务完成
+      while (this.processingQueues.has(queueKey)) {
+        await this.processingQueues.get(queueKey);
+      }
+      
+      // 创建当前任务的Promise
+      let resolveTask: () => void;
+      const taskPromise = new Promise<void>((resolve) => {
+        resolveTask = resolve;
+      });
+      this.processingQueues.set(queueKey, taskPromise);
+      
+      try {
+        await this.processStickerMessage(msg, session, isPhoto, isSticker);
+      } finally {
+        // 任务完成，移除队列
+        this.processingQueues.delete(queueKey);
+        resolveTask!();
+      }
+    };
+    
+    await processTask();
+  }
+
+  // 处理单个贴纸/图片消息
+  private async processStickerMessage(msg: Api.Message, session: BatchSession, isPhoto: boolean, isSticker: boolean): Promise<void> {
+    const client = msg.client;
+    if (!client) return;
+
+    // 显示处理中状态
+    const processingMsg = await msg.reply({
+      message: `⏳ 处理中... (${session.count + 1})`,
+    });
+
+    try {
+      if (isSticker) {
+        // 贴纸：视频贴纸超长会自动压缩后重试
+        const document = (msg.media as Api.MessageMediaDocument).document as Api.Document;
+        await this.invokeAddSticker(
+          client, msg.peerId!, session.stickerSetShortName, document
+        );
+      } else {
+        // 图片：下载并转换为贴纸
+        const buffer = await msg.downloadMedia();
+        if (!Buffer.isBuffer(buffer)) return;
+
+        // 转换为贴纸
+        const stickerBuffer = await sharp(buffer)
+          .resize(512, 512, {
+            fit: 'contain',
+            background: { r: 0, g: 0, b: 0, alpha: 0 }
+          })
+          .webp({ quality: 90 })
+          .toBuffer();
+
+        // 先发送贴纸到聊天，获取document
+        const sentMsg = await client.sendFile(msg.peerId!, {
+          workers: 1,
+          file: new CustomFile("sticker.webp", stickerBuffer.length, "", stickerBuffer),
+          attributes: [
+            new Api.DocumentAttributeSticker({
+              alt: "⭐",
+              stickerset: new Api.InputStickerSetEmpty()
+            }),
+            new Api.DocumentAttributeFilename({ fileName: "sticker.webp" })
+          ],
+          forceDocument: false,
+        });
+
+        // 从发送的消息中获取document
+        this.ignoreInternalMessage(sentMsg);
+        if (sentMsg && sentMsg.media instanceof Api.MessageMediaDocument) {
+          const doc = sentMsg.media.document as Api.Document;
+          const documentToAdd = new Api.InputDocument({
+            id: doc.id,
+            accessHash: doc.accessHash,
+            fileReference: doc.fileReference || Buffer.from([]),
+          });
+
+          // 添加到批量贴纸包
+          await client.invoke(new Api.stickers.AddStickerToSet({
+            stickerset: new Api.InputStickerSetShortName({ shortName: session.stickerSetShortName }),
+            sticker: new Api.InputStickerSetItem({
+              document: documentToAdd,
+              emoji: "⭐"
+            }),
+          }));
+          
+          // 删除发送的临时消息
+          try {
+            await sentMsg.delete();
+          } catch (e) {}
+        } else {
+          throw new Error("发送贴纸失败");
+        }
+      }
+
+      // 更新计数
+      session.count++;
+      
+      // 删除原消息
+      try {
+        await msg.delete();
+      } catch (e) {}
+      
+      // 更新处理中消息为完成
+      try {
+        await processingMsg.edit({
+          text: `✅ 已保存第 ${session.count} 个`,
+          parseMode: "html"
+        });
+        // 2秒后自动删除完成提示
+        setTimeout(async () => {
+          try {
+            await processingMsg.delete();
+          } catch (e) {}
+        }, 2000);
+      } catch (e) {}
+
+    } catch (error: any) {
+      console.error("[save_sticker] 批量保存失败:", error);
+      
+      // 更新处理中消息为失败
+      try {
+        await processingMsg.edit({
+          text: `❌ 保存失败: ${error.message}`,
+          parseMode: "html"
+        });
+      } catch (e) {}
+    }
+  }
+
+  // 保存单个贴纸/图片到固定贴纸包
+  private async handleSaveStickerAction(msg: Api.Message, client: any): Promise<void> {
+    // 获取回复的消息
+    let targetMsg = msg;
+    if (msg.replyTo && 'replyToMsgId' in msg.replyTo && msg.replyTo.replyToMsgId) {
+      try {
+        const replyMsgId = msg.replyTo.replyToMsgId;
+        const messages = await client.getMessages(msg.peerId!, {
+          ids: [replyMsgId]
+        });
+        if (messages && messages.length > 0) {
+          targetMsg = messages[0];
+        }
+      } catch (error) {
+        console.error("[save_sticker] 获取回复消息失败:", error);
+      }
+    }
+
+    // 检查媒体类型
+    if (!targetMsg.media) {
+      await msg.edit({
+        text: `❌ 请回复一个贴纸或图片\n\n使用方法: 回复贴纸/图片后发送 <code>${shortCommandName}</code>\n\n或使用 <code>${shortCommandName} start</code> 开始批量收集模式`,
+        parseMode: "html"
+      });
+      return;
+    }
+
+    // 确保有固定贴纸包名称
+    const stickerSetName = this.ensureStickerSetName();
+
+    await msg.edit({ text: "⏳ 正在保存...", parseMode: "html" });
+
+    try {
+      // 判断是贴纸还是图片
+      let isSticker = false;
+      let isPhoto = false;
+      let documentToAdd: any = null;
+      // 贴纸来源文档（视频贴纸需要经过压缩流程，不能直接构造 InputDocument）
+      let stickerSourceDoc: Api.Document | null = null;
+
+      if (targetMsg.media instanceof Api.MessageMediaDocument) {
+        const document = targetMsg.media.document;
+        if (document instanceof Api.Document) {
+          isSticker = document.attributes?.some(attr =>
+            attr instanceof Api.DocumentAttributeSticker
+          );
+          if (isSticker) {
+            stickerSourceDoc = document;
+          } else {
+            isPhoto = isImageDocument(document);
+          }
+        }
+      } else if (targetMsg.media instanceof Api.MessageMediaPhoto) {
+        isPhoto = true;
+      }
+
+      // 如果既不是贴纸也不是图片
+      if (!isSticker && !isPhoto) {
+        await msg.edit({
+          text: `❌ 不支持的媒体类型\n\n请回复贴纸或图片`,
+          parseMode: "html"
+        });
+        return;
+      }
+
+      // 如果是图片，需要下载并转换为贴纸
+      if (isPhoto) {
+        await msg.edit({ text: "⏳ 正在转换图片为贴纸...", parseMode: "html" });
+        
+        const buffer = await targetMsg.downloadMedia();
+        if (!Buffer.isBuffer(buffer)) {
+          await msg.edit({ text: "❌ 下载图片失败", parseMode: "html" });
+          return;
+        }
+
+        // 转换为贴纸格式 (512x512 webp)
+        const stickerBuffer = await sharp(buffer)
+          .resize(512, 512, {
+            fit: 'contain',
+            background: { r: 0, g: 0, b: 0, alpha: 0 }
+          })
+          .webp({ quality: 90 })
+          .toBuffer();
+
+        // 先发送贴纸到聊天，获取document
+        const sentMsg = await client.sendFile(msg.peerId!, {
+          workers: 1,
+          file: new CustomFile("sticker.webp", stickerBuffer.length, "", stickerBuffer),
+          attributes: [
+            new Api.DocumentAttributeSticker({
+              alt: "⭐",
+              stickerset: new Api.InputStickerSetEmpty()
+            }),
+            new Api.DocumentAttributeFilename({ fileName: "sticker.webp" })
+          ],
+          forceDocument: false,
+        });
+
+        // 从发送的消息中获取document
+        this.ignoreInternalMessage(sentMsg);
+        if (sentMsg && sentMsg.media instanceof Api.MessageMediaDocument) {
+          const doc = sentMsg.media.document as Api.Document;
+          documentToAdd = new Api.InputDocument({
+            id: doc.id,
+            accessHash: doc.accessHash,
+            fileReference: doc.fileReference || Buffer.from([]),
+          });
+          
+          // 删除发送的临时消息
+          try {
+            await sentMsg.delete();
+          } catch (e) {}
+        } else {
+          await msg.edit({ text: "❌ 转换贴纸失败", parseMode: "html" });
+          return;
+        }
+      }
+
+      // 检查贴纸包是否存在
+      let stickerSetExists = false;
+      try {
+        const stickerSet = await client.invoke(new Api.messages.GetStickerSet({
+          stickerset: new Api.InputStickerSetShortName({ shortName: stickerSetName }),
+          hash: 0,
+        }));
+        stickerSetExists = stickerSet instanceof Api.messages.StickerSet;
+      } catch (error: any) {
+        if (error.errorMessage !== "STICKERSET_INVALID") {
+          throw error;
+        }
+      }
+
+      if (!stickerSetExists) {
+        // 创建新的贴纸包
+        const me = await client.getMe();
+        if (stickerSourceDoc) {
+          // 贴纸：走安全流程（视频贴纸超长自动压缩）
+          await this.invokeCreateStickerSet(
+            client, msg.peerId!, me, stickerSetName, stickerSetName, stickerSourceDoc
+          );
+        } else {
+          await client.invoke(new Api.stickers.CreateStickerSet({
+            userId: me,
+            title: stickerSetName,
+            shortName: stickerSetName,
+            stickers: [new Api.InputStickerSetItem({
+              document: documentToAdd,
+              emoji: "⭐"
+            })],
+          }));
+        }
+
+        await msg.edit({
+          text: `✅ 已创建新贴纸包并保存!\n\n` +
+            `📦 <b>固定贴纸包:</b> <code>${htmlEscape(stickerSetName)}</code>\n` +
+            `🔗 链接: t.me/addstickers/${htmlEscape(stickerSetName)}`,
+          parseMode: "html"
+        });
+      } else {
+        // 添加到现有贴纸包
+        if (stickerSourceDoc) {
+          await this.invokeAddSticker(
+            client, msg.peerId!, stickerSetName, stickerSourceDoc
+          );
+        } else {
+          await client.invoke(new Api.stickers.AddStickerToSet({
+            stickerset: new Api.InputStickerSetShortName({ shortName: stickerSetName }),
+            sticker: new Api.InputStickerSetItem({
+              document: documentToAdd,
+              emoji: "⭐"
+            }),
+          }));
+        }
+
+        const mediaType = isPhoto ? "图片" : "贴纸";
+        await msg.edit({
+          text: `✅ ${mediaType}已保存!\n\n` +
+            `📦 <b>固定贴纸包:</b> <code>${htmlEscape(stickerSetName)}</code>\n` +
+            `🔗 链接: t.me/addstickers/${htmlEscape(stickerSetName)}`,
+          parseMode: "html"
+        });
+      }
+
+    } catch (error: any) {
+      console.error("[save_sticker] 保存失败:", error);
+      
+      let errorMsg = "❌ 保存失败";
+      if (error.errorMessage === "STICKERS_TOO_MUCH") {
+        errorMsg = "❌ 贴纸包已满（最多120个贴纸）";
+      } else if (error.errorMessage === "STICKERSET_INVALID") {
+        errorMsg = "❌ 贴纸包名称无效";
+      } else if (error.errorMessage === "STICKER_VIDEO_LONG") {
+        errorMsg = describeStickerError(error);
+      } else if (error.message) {
+        errorMsg = `❌ 保存失败: ${error.message}`;
+      }
+      
+      await msg.edit({ text: errorMsg, parseMode: "html" });
+    }
+  }
+}
+
+export default new SaveStickerPlugin();
