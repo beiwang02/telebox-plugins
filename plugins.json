@@ -1,0 +1,26 @@
+{
+  "aix": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/aix.ts",
+    "desc": "AI 对话、搜索及图片/视频生成"
+  },
+  "s": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/s.ts",
+    "desc": "消息总结及定时任务"
+  },
+  "r": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/r.ts",
+    "desc": "复读消息"
+  },
+  "save_sticker": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/save_sticker.ts",
+    "desc": "保存贴纸，含超长视频贴纸处理"
+  },
+  "track": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/track.ts",
+    "desc": "指定用户及关键词自动回复"
+  },
+  "yl": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/yl.ts",
+    "desc": "生成文字语录贴纸"
+  }
+}

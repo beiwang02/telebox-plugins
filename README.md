@@ -13,6 +13,46 @@
 | `plugins/track.ts` | 按目标用户及关键词自动回复，支持媒体及冷却 |
 | `plugins/yl.ts` | 生成文字语录贴纸 |
 
+## TPM 订阅（推荐）
+
+在运行 TeleBox 的 Telegram 账号中发送（以默认 `.` 前缀为例）：
+
+```text
+.tpm source add https://github.com/beiwang02/telebox-plugins
+```
+
+查看自定义源与插件列表：
+
+```text
+.tpm source
+.tpm ls
+```
+
+按需安装，或安装本仓库这六个插件：
+
+```text
+.tpm i track
+.tpm i aix s r save_sticker track yl
+```
+
+安装会替换同名插件文件，请先确认目标环境兼容。不要为了只安装本仓库而用 `tpm i all`：TPM 会合并官方源与自定义源，`all` 包含官方源。
+
+后续手动更新已安装的远程插件：
+
+```text
+.tpm update
+```
+
+`update` 涉及所有已安装远程插件，不限本仓库。不要随意加 `-f`，以免覆盖本地修改。
+
+移除自定义源（不会卸载已安装插件）：
+
+```text
+.tpm source remove
+```
+
+添加源不是自动更新定时任务；VPS 修改也不会自动上传 GitHub。当前框架仅支持一个自定义源，添加本仓库会替换已有自定义源。同名插件优先使用自定义源。
+
 ## 使用说明
 
 - 适用来源环境：TeleBox Classic 0.2.9（teleproto），不是 TeleBox Next。
