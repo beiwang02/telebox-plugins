@@ -46,7 +46,7 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `🧧 <b>自动抢红包</b>\n\n<code>${c} bind @bot</code> — 添加机器人，立即开启\n<code>${c} list</code> — 查看列表、编号、状态和最近回调\n<code>${c} off 1</code> — 暂停第1项，保留绑定\n<code>${c} on 1</code> — 恢复第1项\n<code>${c} del 1</code> — 删除第1项\n<code>${c} status</code> — 查看状态及最近回调耗时\n<code>${c} inspect</code> — 回复消息检查按钮，不点击\n\n群聊、私聊、收藏夹均可操作，全局生效。\n先用 list 查看最新编号；on/off/del 不带编号操作全部。暂停与关闭同义，恢复用 on。\n自动领取不发群消息；回调返回不等于到账。`;
+  return `<b>🧧 自动抢红包</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} on [编号]</code> - 恢复绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n• <code>${c} inspect</code> - 回复消息检查按钮，不点击\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
 };
 
 export class HbPlugin extends Plugin {
@@ -266,7 +266,7 @@ export class HbPlugin extends Plugin {
       const c = esc(`${getPrefixes()[0] || "."}hb`);
       if (["status", "list"].includes(command)) {
         const rows = entries.map(([, r], i) => `${i + 1}. ${esc(r.label)} · ${r.enabled ? "🟢 开启" : "⏸ 已暂停"}`).join("\n");
-        await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} off 1</code> 暂停第1项\n<code>${c} on 1</code> 恢复第1项\n<code>${c} del 1</code> 删除第1项\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
+        await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} off [编号]</code> - 暂停绑定\n<code>${c} on [编号]</code> - 恢复绑定\n<code>${c} del [编号]</code> - 删除绑定\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
       }
       if (!["on", "off", "unbind"].includes(command)) { await respond(help()); return; }
       if (!entries.length) { await respond("尚未绑定 Bot，请发送 hb bind @机器人用户名。"); return; }
