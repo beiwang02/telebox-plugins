@@ -51,7 +51,7 @@ const help = () => {
 
 export class HbPlugin extends Plugin {
   name = "hb";
-  description = "绑定指定机器人，自动领取红包；支持列表管理与回调状态查看。";
+  description = help;
   listenMessageHandlerIgnoreEdited = false;
   private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
@@ -239,11 +239,15 @@ export class HbPlugin extends Plugin {
     const me = await msg.client?.getMe();
     if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
     const args = (msg.message || "").trim().split(/\s+/).slice(1);
-    const rawCommand = args.shift() || "help";
+    const rawCommand = args.shift() || "usage";
     const command = ({ pause: "off", resume: "on", del: "unbind" } as Record<string, string>)[rawCommand] || rawCommand;
     if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); this.preparations.clear(); }
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
+      if (command === "usage") {
+        const p = esc(getPrefixes()[0] || ".");
+        await respond(`用法：<code>${p}hb bind &lt;@机器人&gt;</code> 绑定并开启\n管理：<code>${p}hb list</code>\n详细帮助：<code>${p}h hb</code>`); return;
+      }
       if (command === "bind") {
         const username = args.shift();
         if (!username || !/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(username)) { await respond("用法：<code>hb bind @机器人用户名</code>，无需回复红包；群聊、私聊和收藏夹均可操作。"); return; }

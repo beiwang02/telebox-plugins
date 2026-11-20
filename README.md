@@ -20,6 +20,7 @@
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
+| `hb` | 绑定指定 Bot，自动领取回调红包 |
 
 ## 订阅安装
 
@@ -38,7 +39,7 @@
 安装本仓库全部插件：
 
 ```text
-.tpm i aix s r save_sticker track yl hb hb hb hb hb hb hb hb
+.tpm i aix s r save_sticker track yl hb hb hb hb hb hb hb hb hb
 ```
 
 手动更新已安装的远程插件：
