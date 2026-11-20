@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 /**
  * hb — TeleBox Classic 0.2.9 定向抢红包插件。
  *
- * 使用：在任意聊天执行 `.hb bind @bot`，再执行 `.hb on`。
+ * 使用：在任意聊天执行 `.hb bind @bot`，绑定后直接开启。
  * 按真实 Bot ID 全局匹配，不受管理命令发送位置影响；数据在 assets/hb/state.json。
  *
  * 安全边界：只提交明确选定的 callback，不打开链接、WebApp、支付或授权页面。
@@ -46,7 +46,7 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `🧧 <b>全局定向抢红包</b>\n\n<code>${c} bind @bot</code> — 绑定 Bot，无需回复红包\n<code>${c} bind @bot 按钮完整文字</code> — 可选指定按钮\n<code>${c} on</code> / <code>${c} off</code> — 全局开关\n<code>${c} status</code> / <code>${c} list</code> — 状态\n<code>${c} unbind</code> — 解绑\n<code>${c} inspect</code> — 回复消息检查按钮（不点击）\n\n群聊、私聊和收藏夹都可管理。只按真实 Bot ID 匹配所有会话，不按命令位置限定。默认关闭；只领取正文含红包且只有一个明确领取回调的消息，不执行 URL/WebApp、转发、inline 代发。开启后等新红包，不补扫历史。领取过程不发群消息，Bot 可能公布名单。`;
+  return `🧧 <b>自动抢红包</b>\n\n<code>${c} bind @bot</code> — 添加机器人，立即开启\n<code>${c} list</code> — 查看列表、编号、状态和最近回调\n<code>${c} off 1</code> — 暂停第1项，保留绑定\n<code>${c} on 1</code> — 恢复第1项\n<code>${c} del 1</code> — 删除第1项\n<code>${c} status</code> — 查看状态及最近回调耗时\n<code>${c} inspect</code> — 回复消息检查按钮，不点击\n\n群聊、私聊、收藏夹均可操作，全局生效。\n先用 list 查看最新编号；on/off/del 不带编号操作全部。暂停与关闭同义，恢复用 on。\n自动领取不发群消息；回调返回不等于到账。`;
 };
 
 export class HbPlugin extends Plugin {
@@ -239,7 +239,8 @@ export class HbPlugin extends Plugin {
     const me = await msg.client?.getMe();
     if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
     const args = (msg.message || "").trim().split(/\s+/).slice(1);
-    const command = args.shift() || "help";
+    const rawCommand = args.shift() || "help";
+    const command = ({ pause: "off", resume: "on", del: "unbind" } as Record<string, string>)[rawCommand] || rawCommand;
     if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); this.preparations.clear(); }
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
@@ -251,29 +252,38 @@ export class HbPlugin extends Plugin {
         catch { await respond("无法解析这个用户名，原绑定未改变。请确认 Bot 用户名有效。"); return; }
         if (!(bot instanceof Api.User) || !bot.bot) { await respond("目标不是 Bot，原绑定未改变。"); return; }
         const next = this.copy();
-        // 单 Bot 模式：重绑不继承旧的开启状态，也不清除历史去重。
-        next.rules = { [bot.id.toString()]: { bot: bot.id.toString(), label: bot.username ? `@${bot.username}` : (bot.firstName || "Bot"), buttons: args.length ? [args.join(" ")] : [], enabled: false, since: 0, owner: me.id.toString() } };
+        // 添加/重绑立即开启，只更新这个 Bot，不覆盖其它绑定，也不清除防重复记录。
+        next.rules[bot.id.toString()] = { bot: bot.id.toString(), label: bot.username ? `@${bot.username}` : (bot.firstName || "Bot"), buttons: args.length ? [args.join(" ")] : [], enabled: true, since: Math.floor(Date.now() / 1000), owner: me.id.toString() };
         await this.save(next);
-        await respond(`已绑定 <b>${esc(next.rules[bot.id.toString()].label)}</b>\nBot ID：<code>${bot.id}</code>\n范围：账号能收到该 Bot 直接消息的所有会话\n状态：关闭。发送 <code>${esc(getPrefixes()[0] || ".")}hb on</code> 开启。\n领取时不发送群消息；Bot 可能公布领取名单。`); return;
+        await respond(`✅ 已绑定并开启 <b>${esc(next.rules[bot.id.toString()].label)}</b>\n发送 <code>${esc(getPrefixes()[0] || ".")}hb list</code> 查看和管理。`); return;
       }
       if (command === "inspect") {
         const target = await msg.getReplyMessage();
         if (!(target instanceof Api.Message)) { await respond("inspect 需要回复一条消息；bind 不需要回复，直接 hb bind @bot。"); return; }
         await respond(buttonsOf(target).slice(0, 20).map(b => `${esc(b.text.slice(0, 100))} — ${esc(b.kind)}（${b.data ? "回调" : "不执行"}）`).join("\n") || "没有 inline 按钮；未执行任何点击。"); return;
       }
-      const entries = Object.entries(this.state.rules).filter(([, r]) => r.owner === me.id.toString());
+      const entries = Object.entries(this.state.rules).filter(([, r]) => r.owner === me.id.toString()).sort(([a], [b]) => a.localeCompare(b));
+      const c = esc(`${getPrefixes()[0] || "."}hb`);
       if (["status", "list"].includes(command)) {
-        await respond(`🧧 <b>全局 Bot 绑定</b>\n${entries.map(([id, r]) => `${esc(r.label)} · <code>${id}</code> · ${r.enabled ? "开启" : "关闭"}`).join("\n") || "未绑定；发送 hb bind @bot"}\n范围：所有能收到该 Bot 消息的会话\n限流暂停：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近：${esc(this.recent)}`); return;
+        const rows = entries.map(([, r], i) => `${i + 1}. ${esc(r.label)} · ${r.enabled ? "🟢 开启" : "⏸ 已暂停"}`).join("\n");
+        await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} off 1</code> 暂停第1项\n<code>${c} on 1</code> 恢复第1项\n<code>${c} del 1</code> 删除第1项\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
       }
       if (!["on", "off", "unbind"].includes(command)) { await respond(help()); return; }
       if (!entries.length) { await respond("尚未绑定 Bot，请发送 hb bind @机器人用户名。"); return; }
+      const selector = args.shift();
+      let selected = entries;
+      if (selector) {
+        const index = /^\d+$/.test(selector) ? Number(selector) - 1 : -1;
+        if (!Number.isSafeInteger(index) || index < 0 || index >= entries.length || args.length) { await respond(`编号无效，请先发送 <code>${c} list</code> 查看。`); return; }
+        selected = [entries[index]];
+      }
       const next = this.copy();
-      for (const [id] of entries) {
+      for (const [id] of selected) {
         if (command === "unbind") delete next.rules[id];
         else { next.rules[id].enabled = command === "on"; if (command === "on") next.rules[id].since = Math.floor(Date.now() / 1000) + 1; }
       }
       await this.save(next);
-      await respond(command === "unbind" ? "已删除全局 Bot 绑定，保留防重复记录。" : command === "on" ? "已全局开启：锁定绑定 Bot，自动识别新红包的领取回调；不会在群里发送领取提示，不补扫历史消息。" : "已全局关闭；已发出的请求无法撤回。");
+      await respond(`${command === "unbind" ? "🗑 已删除" : command === "on" ? "🟢 已开启" : "⏸ 已暂停"}：${selected.map(([, r]) => esc(r.label)).join("、")}\n<code>${c} list</code> 查看最新列表。`);
     });
   } };
 }
