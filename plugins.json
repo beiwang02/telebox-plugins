@@ -22,5 +22,9 @@
   "yl": {
     "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/yl.ts",
     "desc": "生成文字语录贴纸"
+  },
+  "hb": {
+    "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/hb.ts",
+    "desc": "绑定指定 Bot 的回调红包自动领取，支持新消息和编辑、防重复及限流暂停"
   }
 }
