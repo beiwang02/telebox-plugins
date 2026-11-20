@@ -23,6 +23,8 @@ type Button = { text: string; kind: string; data?: Buffer };
 const root = path.resolve("assets/hb");
 const esc = (v: string) => v.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 const packet = (s: string) => /红包|紅包/.test(s);
+// 红包初始正文可为空，按钮为可变祝福语；不能据此推断稳定的 callback 协议。
+// 空正文的图片仅在可信 Bot 刚发送准备提示之后，且只有一个普通回调时作为候选。
 const ended = (s: string) => /已.{0,8}(抢光|搶光|领完|領完|领取完|領取完|过期|過期)|红包.{0,8}(结束|結束|失效)/.test(s);
 const claimLabel = (s: string) => /领取|領取|抢红包|搶紅包|拆红包|拆紅包|打开红包|打開紅包|开红包|開紅包|^\s*[🧧🎁\s]*(抢|搶|拆|开|開)[🧧🎁\s]*$/.test(s);
 /**
@@ -60,6 +62,13 @@ export class HbPlugin extends Plugin {
   private recent = "尚未提交回调";
   private owner = "";
   private epoch = 0;
+  private preparations = new Map<string, { bot: string; at: number; id: number }>();
+  private contextualClaim(msg: Api.Message) {
+    const p = this.preparations.get(msg.chatId?.toString() || "");
+    if (!p || p.bot !== msg.senderId?.toString() || Date.now() - p.at > 15000 || msg.id <= p.id || msg.message || !msg.photo) return false;
+    const bs = buttonsOf(msg);
+    return bs.length === 1 && !!bs[0].data?.length;
+  }
   private boosts = new Map<string, { until: number; started: number; epoch: number; minId: number; timer?: ReturnType<typeof setTimeout> }>();
   private lastPoll = 0;
   private polling = false;
@@ -78,6 +87,11 @@ export class HbPlugin extends Plugin {
     const command = text.match(/^\/red(?:@([a-zA-Z0-9_]+))?(?:\s|$)/i);
     const red = command && (!command[1] || rules.some(r => r.label.toLowerCase() === `@${command[1].toLowerCase()}`));
     const preparing = msg.fromId instanceof Api.PeerUser && rules.some(r => r.bot === msg.senderId?.toString()) && /正在准备红包|正在準備紅包/.test(text);
+    if (preparing) {
+      const key = msg.chatId.toString();
+      if (this.preparations.size >= 100) for (const [k, v] of this.preparations) if (Date.now() - v.at > 15000) this.preparations.delete(k);
+      if (this.preparations.size < 100 || this.preparations.has(key)) this.preparations.set(key, { bot: msg.senderId!.toString(), at: Date.now(), id: msg.id });
+    }
     if (!red && !preparing) return;
     const chat = msg.chatId.toString();
     if (this.boosts.has(chat) || this.boosts.size >= 4) return;
@@ -160,7 +174,7 @@ export class HbPlugin extends Plugin {
     if (!this.live() || msg.out || msg.fwdFrom || msg.viaBotId || !msg.chatId || !msg.senderId || !(msg.fromId instanceof Api.PeerUser)) return;
     const r = this.state.rules[msg.senderId.toString()];
     const age = Date.now() / 1000 - Number(msg.date);
-    if (!r?.enabled || !this.owner || r.owner !== this.owner || Number(msg.date) < r.since || r.bot !== msg.senderId.toString() || !Number.isFinite(age) || age < -10 || age > 120 || !packet(msg.message || "") || ended(msg.message || "")) return;
+    if (!r?.enabled || !this.owner || r.owner !== this.owner || Number(msg.date) < r.since || r.bot !== msg.senderId.toString() || !Number.isFinite(age) || age < -10 || age > 120 || (!packet(msg.message || "") && !this.contextualClaim(msg)) || ended(msg.message || "")) return;
     return r;
   }
   /** 新建与编辑走相同流水线；队列最多保留 20 个任务，积压时丢弃而非突发补抢。 */
@@ -187,7 +201,7 @@ export class HbPlugin extends Plugin {
     const fresh = msg;
     const r = this.matches(fresh);
     if (!r || this.state.seen[key]) return;
-    const choices = buttonsOf(fresh).filter(b => b.data?.length && (r.buttons.length ? r.buttons.includes(b.text) : claimLabel(b.text)));
+    const choices = buttonsOf(fresh).filter(b => b.data?.length && (r.buttons.length ? r.buttons.includes(b.text) : claimLabel(b.text) || this.contextualClaim(fresh)));
     if (choices.length !== 1 || !this.live() || epoch !== this.epoch) return;
     const next = this.copy(); const now = Date.now();
     next.seen = Object.fromEntries(Object.entries(next.seen).filter(([, ts]) => now - ts < 7 * 86400000));
@@ -226,7 +240,7 @@ export class HbPlugin extends Plugin {
     if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
     const args = (msg.message || "").trim().split(/\s+/).slice(1);
     const command = args.shift() || "help";
-    if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); }
+    if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); this.preparations.clear(); }
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
       if (command === "bind") {
