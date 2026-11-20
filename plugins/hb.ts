@@ -51,7 +51,7 @@ const help = () => {
 
 export class HbPlugin extends Plugin {
   name = "hb";
-  description = help;
+  description = "绑定指定机器人，自动领取红包；支持列表管理与回调状态查看。";
   listenMessageHandlerIgnoreEdited = false;
   private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
