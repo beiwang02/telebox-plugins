@@ -9,8 +9,8 @@ import { randomUUID } from "node:crypto";
 /**
  * hb — TeleBox Classic 0.2.9 定向抢红包插件。
  *
- * 使用：回复 Bot 的未结束红包执行 `.hb bind`，确认按钮后执行 `.hb on`。
- * 每个会话独立绑定一个 Bot；配置及去重记录保存在 assets/hb/state.json。
+ * 使用：在任意聊天执行 `.hb bind @bot`，再执行 `.hb on`。
+ * 按真实 Bot ID 全局匹配，不受管理命令发送位置影响；数据在 assets/hb/state.json。
  *
  * 安全边界：只提交明确选定的 callback，不打开链接、WebApp、支付或授权页面。
  * Bot 身份、红包关键词及按钮文字只是触发条件，不能证明 Bot 的业务行为安全。
@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
  * 运行前应遵守所在群及 Bot 的使用规则。仅支持单进程运行，不支持共享状态多实例。
  */
 type Rule = { bot: string; label: string; buttons: string[]; enabled: boolean; since: number; owner: string };
-type State = { version: 1; rules: Record<string, Rule>; seen: Record<string, number>; pausedUntil: number };
+type State = { version: 1 | 2; rules: Record<string, Rule>; seen: Record<string, number>; pausedUntil: number };
 type Button = { text: string; kind: string; data?: Buffer };
 const root = path.resolve("assets/hb");
 const esc = (v: string) => v.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -44,14 +44,14 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `🧧 <b>定向抢红包</b>\n\n回复目标 Bot 的一条未抢完红包：\n<code>${c} bind</code> — 绑定当前会话与 Bot，自动识别领取回调按钮\n<code>${c} bind 按钮完整文字</code> — 指定样本中的领取按钮\n<code>${c} inspect</code> — 只读检查回复消息的按钮类型（不显示回调数据）\n\n<code>${c} on</code> — 开启当前会话\n<code>${c} off</code> — 关闭当前会话\n<code>${c} status</code> — 状态与最近动作\n<code>${c} list</code> — 列出绑定\n<code>${c} unbind</code> — 删除当前绑定\n\n默认关闭；只匹配当前会话、绑定 Bot、红包文字与精确按钮文字。只支持直接由 Bot 发出的回调红包，不访问 URL/WebApp，不处理转发或 inline 代发。超时不重试；API 回调返回不等于领取成功。`;
+  return `🧧 <b>全局定向抢红包</b>\n\n<code>${c} bind @bot</code> — 绑定 Bot，无需回复红包\n<code>${c} bind @bot 按钮完整文字</code> — 可选指定按钮\n<code>${c} on</code> / <code>${c} off</code> — 全局开关\n<code>${c} status</code> / <code>${c} list</code> — 状态\n<code>${c} unbind</code> — 解绑\n<code>${c} inspect</code> — 回复消息检查按钮（不点击）\n\n群聊、私聊和收藏夹都可管理。只按真实 Bot ID 匹配所有会话，不按命令位置限定。默认关闭；只领取正文含红包且只有一个明确领取回调的消息，不执行 URL/WebApp、转发、inline 代发。开启后等新红包，不补扫历史。领取过程不发群消息，Bot 可能公布名单。`;
 };
 
 export class HbPlugin extends Plugin {
   name = "hb";
   description = help;
   listenMessageHandlerIgnoreEdited = false;
-  private state: State = { version: 1, rules: {}, seen: {}, pausedUntil: 0 };
+  private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
   private signal?: AbortSignal;
   private active = false;
@@ -74,10 +74,12 @@ export class HbPlugin extends Plugin {
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
     try {
       const s: State = JSON.parse(await fs.readFile(path.join(root, "state.json"), "utf8"));
-      if (s.version !== 1 || !s.rules || Array.isArray(s.rules) || !s.seen || Array.isArray(s.seen) || !Number.isFinite(s.pausedUntil)) throw Error("invalid state");
-      for (const [id, r] of Object.entries(s.rules)) if (!/^-?\d+$/.test(id) || !r || !/^\d+$/.test(r.bot) || typeof r.label !== "string" || typeof r.enabled !== "boolean" || !Number.isFinite(r.since) || !/^\d+$/.test(r.owner) || !Array.isArray(r.buttons) || !r.buttons.length || r.buttons.some(x => typeof x !== "string" || !x || x.length > 256)) throw Error("invalid rule");
+      if (![1, 2].includes(s.version) || !s.rules || Array.isArray(s.rules) || !s.seen || Array.isArray(s.seen) || !Number.isFinite(s.pausedUntil)) throw Error("invalid state");
+      for (const [id, r] of Object.entries(s.rules)) if (!/^-?\d+$/.test(id) || !r || !/^\d+$/.test(r.bot) || typeof r.label !== "string" || typeof r.enabled !== "boolean" || !Number.isFinite(r.since) || !/^\d+$/.test(r.owner) || !Array.isArray(r.buttons) || r.buttons.some(x => typeof x !== "string" || !x || x.length > 256)) throw Error("invalid rule");
       for (const [k, v] of Object.entries(s.seen)) if (!/^-?\d+:\d+$/.test(k) || !Number.isFinite(v)) throw Error("invalid dedup record");
-      this.state = s;
+      // 旧规则仅授权单个会话，不得升级后自动扩展到所有会话；清除绑定但保留去重与限流。
+      if (s.version === 1) { s.version = 2; s.rules = {}; await this.save(s); }
+      else this.state = s;
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw Error("hb 状态文件无效，拒绝覆盖"); }
     this.active = true;
   }
@@ -90,13 +92,13 @@ export class HbPlugin extends Plugin {
   }
   private copy(): State { return JSON.parse(JSON.stringify(this.state)); }
   /**
-   * 共同入口条件：当前账号、当前会话、真实 Bot 发送者、启用时间、消息年龄及正文。
+   * 共同入口条件：当前账号、绑定的真实 Bot 发送者、启用时间、消息年龄及正文。
    * viaBotId 是 inline 内容提供者，不是真实发送者，不能用它替代 senderId 校验。
    * 转发及 inline 代发一律跳过；年龄按原始发送时间计算，不因编辑而重新变年轻。
    */
   private matches(msg: Api.Message): Rule | undefined {
     if (!this.live() || msg.out || msg.fwdFrom || msg.viaBotId || !msg.chatId || !msg.senderId || !(msg.fromId instanceof Api.PeerUser)) return;
-    const r = this.state.rules[msg.chatId.toString()];
+    const r = this.state.rules[msg.senderId.toString()];
     const age = Date.now() / 1000 - Number(msg.date);
     if (!r?.enabled || !this.owner || r.owner !== this.owner || Number(msg.date) < r.since || r.bot !== msg.senderId.toString() || !Number.isFinite(age) || age < -10 || age > 120 || !packet(msg.message || "") || ended(msg.message || "")) return;
     return r;
@@ -120,7 +122,7 @@ export class HbPlugin extends Plugin {
     const fresh = msg;
     const r = this.matches(fresh);
     if (!r || this.state.seen[key]) return;
-    const choices = buttonsOf(fresh).filter(b => b.data?.length && r.buttons.includes(b.text));
+    const choices = buttonsOf(fresh).filter(b => b.data?.length && (r.buttons.length ? r.buttons.includes(b.text) : claimLabel(b.text)));
     if (choices.length !== 1 || !this.live() || epoch !== this.epoch) return;
     const next = this.copy(); const now = Date.now();
     next.seen = Object.fromEntries(Object.entries(next.seen).filter(([, ts]) => now - ts < 7 * 86400000));
@@ -148,49 +150,46 @@ export class HbPlugin extends Plugin {
       } else this.recent = "回调失败或结果未知，已去重，不自动重试";
     }
   }
+  /** 管理命令在群聊、私聊、收藏夹均可执行；只有账号本人有权修改全局绑定。 */
   cmdHandlers = { hb: async (msg: Api.Message) => {
-    // 只允许账号本人管理自动动作，不将 TeleBox sudo 命令权限扩大成自动领取权限。
     const me = await msg.client?.getMe();
-    if (!me || msg.senderId?.toString() !== me.id.toString() || !msg.out) return;
-    this.owner = me.id.toString();
-    const earlyCommand = (msg.message || "").trim().split(/\s+/)[1];
-    // 在进入串行队列前使旧任务失效，关闭/重绑无需等待积压队列全部执行。
-    // 已经发往 Telegram 的 RPC 无法撤销，因此不能承诺关闭瞬间撤回在途请求。
-    if (["off", "unbind", "bind"].includes(earlyCommand)) this.epoch++;
-    if (!this.live()) return;
+    if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
+    const args = (msg.message || "").trim().split(/\s+/).slice(1);
+    const command = args.shift() || "help";
+    if (["bind", "off", "unbind"].includes(command)) this.epoch++;
     await this.serial(async () => {
-      const chat = msg.chatId?.toString(); if (!chat) return;
-      const args = (msg.message || "").trim().split(/\s+/).slice(1); const command = args.shift() || "help";
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
-      if (command === "help") { await respond(help()); return; }
-      if (["bind", "inspect"].includes(command)) {
-        const target = await msg.getReplyMessage();
-        if (!(target instanceof Api.Message) || target.chatId?.toString() !== chat) { await respond("请回复当前会话中 Bot 发出的红包消息再执行。"); return; }
-        const bs = buttonsOf(target);
-        if (command === "inspect") {
-          await respond(`🧧 <b>按钮检查（未点击）</b>\n${target.fwdFrom ? "转发消息；不支持绑定\n" : ""}${target.viaBotId ? "Inline 代发；不支持绑定\n" : ""}${bs.length ? bs.slice(0, 20).map((b, i) => `${i + 1}. ${esc(b.text.slice(0, 100))} — ${esc(b.kind)}${b.data ? "（回调）" : "（不执行）"}`).join("\n") : "没有 inline 按钮"}`); return;
-        }
-        if (target.fwdFrom || target.viaBotId || !(target.fromId instanceof Api.PeerUser)) { await respond("只支持直接由 Bot 发出的红包，转发、频道代发和 inline 代发均跳过。"); return; }
-        const bot = await target.getSender();
-        if (!(bot instanceof Api.User) || !bot.bot || !packet(target.message || "") || ended(target.message || "")) { await respond("请回复 Bot 直接发出的一条未抢完、正文含“红包”的消息。"); return; }
-        const exact = args.join(" ");
-        const candidates = bs.filter(b => b.data?.length && (exact ? b.text === exact : claimLabel(b.text)));
-        if (candidates.length !== 1) { await respond("无法唯一确定领取回调按钮。先用 hb inspect 检查，再用 hb bind 按钮完整文字绑定。URL/WebApp/需密码按钮不支持。"); return; }
-        const next = this.copy(); next.rules[chat] = { bot: bot.id.toString(), label: bot.username ? `@${bot.username}` : (bot.firstName || "Bot"), buttons: [candidates[0].text], enabled: false, since: 0, owner: me.id.toString() };
+      if (command === "bind") {
+        const username = args.shift();
+        if (!username || !/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(username)) { await respond("用法：<code>hb bind @机器人用户名</code>，无需回复红包；群聊、私聊和收藏夹均可操作。"); return; }
+        let bot;
+        try { bot = await msg.client!.getEntity(username.startsWith("@") ? username : `@${username}`); }
+        catch { await respond("无法解析这个用户名，原绑定未改变。请确认 Bot 用户名有效。"); return; }
+        if (!(bot instanceof Api.User) || !bot.bot) { await respond("目标不是 Bot，原绑定未改变。"); return; }
+        const next = this.copy();
+        // 单 Bot 模式：重绑不继承旧的开启状态，也不清除历史去重。
+        next.rules = { [bot.id.toString()]: { bot: bot.id.toString(), label: bot.username ? `@${bot.username}` : (bot.firstName || "Bot"), buttons: args.length ? [args.join(" ")] : [], enabled: false, since: 0, owner: me.id.toString() } };
         await this.save(next);
-        await respond(`已绑定 <b>${esc(next.rules[chat].label)}</b>\nBot ID：<code>${bot.id}</code>\n按钮：${esc(candidates[0].text)}\n范围：当前会话\n状态：关闭。确认后发送 <code>${esc(getPrefixes()[0] || ".")}hb on</code>；不会补抢绑定样本或历史红包。`); return;
+        await respond(`已绑定 <b>${esc(next.rules[bot.id.toString()].label)}</b>\nBot ID：<code>${bot.id}</code>\n范围：账号能收到该 Bot 直接消息的所有会话\n状态：关闭。发送 <code>${esc(getPrefixes()[0] || ".")}hb on</code> 开启。\n领取时不发送群消息；Bot 可能公布领取名单。`); return;
       }
-      if (command === "list") {
-        await respond(Object.entries(this.state.rules).map(([id, r]) => `<code>${esc(id)}</code> · ${esc(r.label)} · ${r.enabled ? "开启" : "关闭"}`).join("\n") || "尚未绑定 Bot。"); return;
+      if (command === "inspect") {
+        const target = await msg.getReplyMessage();
+        if (!(target instanceof Api.Message)) { await respond("inspect 需要回复一条消息；bind 不需要回复，直接 hb bind @bot。"); return; }
+        await respond(buttonsOf(target).slice(0, 20).map(b => `${esc(b.text.slice(0, 100))} — ${esc(b.kind)}（${b.data ? "回调" : "不执行"}）`).join("\n") || "没有 inline 按钮；未执行任何点击。"); return;
       }
-      const rule = this.state.rules[chat];
-      if (command === "status") { await respond(`当前会话：${rule ? `${esc(rule.label)} / ${rule.enabled ? "开启" : "关闭"}` : "未绑定"}\n限流暂停：${this.state.pausedUntil > Date.now() ? `${Math.ceil((this.state.pausedUntil - Date.now()) / 1000)} 秒` : "无"}\n最近：${esc(this.recent)}`); return; }
+      const entries = Object.entries(this.state.rules).filter(([, r]) => r.owner === me.id.toString());
+      if (["status", "list"].includes(command)) {
+        await respond(`🧧 <b>全局 Bot 绑定</b>\n${entries.map(([id, r]) => `${esc(r.label)} · <code>${id}</code> · ${r.enabled ? "开启" : "关闭"}`).join("\n") || "未绑定；发送 hb bind @bot"}\n范围：所有能收到该 Bot 消息的会话\n限流暂停：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近：${esc(this.recent)}`); return;
+      }
       if (!["on", "off", "unbind"].includes(command)) { await respond(help()); return; }
-      if (!rule) { await respond("当前会话尚未绑定，请回复 Bot 红包执行 hb bind。"); return; }
+      if (!entries.length) { await respond("尚未绑定 Bot，请发送 hb bind @机器人用户名。"); return; }
       const next = this.copy();
-      if (command === "unbind") delete next.rules[chat]; else { next.rules[chat].enabled = command === "on"; if (command === "on") { next.rules[chat].since = Math.floor(Date.now() / 1000) + 1; next.rules[chat].owner = me.id.toString(); } }
+      for (const [id] of entries) {
+        if (command === "unbind") delete next.rules[id];
+        else { next.rules[id].enabled = command === "on"; if (command === "on") next.rules[id].since = Math.floor(Date.now() / 1000) + 1; }
+      }
       await this.save(next);
-      await respond(command === "unbind" ? "已删除当前绑定（保留防重复记录）。" : command === "on" ? "已开启当前会话的定向抢红包。只处理最近 120 秒内的实时更新；不扫描历史消息，不保证抢到。" : "已关闭当前会话的定向抢红包。");
+      await respond(command === "unbind" ? "已删除全局 Bot 绑定，保留防重复记录。" : command === "on" ? "已全局开启：锁定绑定 Bot，自动识别新红包的领取回调；不会在群里发送领取提示，不补扫历史消息。" : "已全局关闭；已发出的请求无法撤回。");
     });
   } };
 }
