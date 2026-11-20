@@ -18,6 +18,7 @@
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
 | `hb` | 绑定指定 Bot，自动领取回调红包 |
+| `hb` | 绑定指定 Bot，自动领取回调红包 |
 
 ## 订阅安装
 
@@ -36,7 +37,7 @@
 安装本仓库全部插件：
 
 ```text
-.tpm i aix s r save_sticker track yl hb hb hb hb hb hb
+.tpm i aix s r save_sticker track yl hb hb hb hb hb hb hb
 ```
 
 手动更新已安装的远程插件：
@@ -65,7 +66,6 @@
 | `.hb on [编号]` | 恢复指定绑定 |
 | `.hb del [编号]` | 删除指定绑定 |
 | `.hb status` | 查看状态及最近回调耗时，不是完整历史 |
-| `.hb inspect` | 回复消息检查按钮，不点击 |
 
 编号以最新 list 为准；on/off/del 不带编号操作全部。更新保留现有开关，不会擅自恢复已暂停绑定。
 

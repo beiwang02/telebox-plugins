@@ -46,7 +46,7 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `<b>🧧 自动抢红包</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} on [编号]</code> - 恢复绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n• <code>${c} inspect</code> - 回复消息检查按钮，不点击\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
+  return `<b>🧧 自动抢红包</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} on [编号]</code> - 恢复绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
 };
 
 export class HbPlugin extends Plugin {
