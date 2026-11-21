@@ -256,7 +256,7 @@ export class HbPlugin extends Plugin {
     if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
     const args = (msg.message || "").trim().split(/\s+/).slice(1);
     const c = esc(`${getPrefixes()[0] || "."}hb`);
-    const prompt = `请输入机器人用户名：<code>${c} &lt;@机器人用户名&gt;</code>`;
+    const prompt = `💡 请输入机器人用户名：<code>${c} &lt;@机器人用户名&gt;</code>`;
     const first = args.shift();
     if (!first) {
       await msg.edit({ text: prompt, parseMode: "html" });
