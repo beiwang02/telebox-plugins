@@ -25227,7 +25227,7 @@ async function handleTaskAdd(ctx) {
       text: `\u274C \u683C\u5F0F\u9519\u8BEF
 
 \u7528\u6CD5: <code>${ctx.mainPrefix}s add &lt;\u95F4\u9694&gt; [--chat \u76EE\u6807\u7FA4] [--push \u63A8\u9001\u76EE\u6807] [--provider \u540D\u79F0] [--prompt \u63D0\u793A\u8BCD]</code>
-\u793A\u4F8B: <code>${ctx.mainPrefix}s add 6h</code> / <code>${ctx.mainPrefix}s add 6h --chat </code>&lt;群组标识&gt; / <code>${ctx.mainPrefix}s add 6h --push me</code>`,
+\u793A\u4F8B: <code>${ctx.mainPrefix}s add 6h</code> / <code>${ctx.mainPrefix}s add 6h --chat &lt;群组标识&gt;</code> / <code>${ctx.mainPrefix}s add 6h --push me</code>`,
       parseMode: "html"
     });
     return;
