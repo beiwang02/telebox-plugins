@@ -19211,7 +19211,7 @@ async function handleConfigCommand(ctx) {
     await ctx.msg.edit({ text: `\u2705 \u5DF2\u5220\u9664\u914D\u7F6E ${name}` });
     return true;
   }
-  await ctx.msg.edit({ text: `⚙️ 查看 API 配置：<code>${ctx.mainPrefix}s config list</code>\n完整用法：<code>${ctx.mainPrefix}h s</code>`, parseMode: "html" });
+  await ctx.msg.edit({ text: `⚙️ 查看 API 配置：<code>${ctx.mainPrefix}s config list</code>\n完整用法：<code>${ctx.mainPrefix}help s</code>`, parseMode: "html" });
   return true;
 }
 
@@ -25224,7 +25224,7 @@ async function handleTaskAdd(ctx) {
   const intervalInput = ctx.args[0];
   if (!intervalInput) {
     await ctx.msg.edit({
-      text: `⚙️ 请输入总结间隔：<code>${ctx.mainPrefix}s add &lt;间隔&gt;</code>\n完整用法：<code>${ctx.mainPrefix}h s</code>`,
+      text: `⚙️ 请输入总结间隔：<code>${ctx.mainPrefix}s add &lt;间隔&gt;</code>\n完整用法：<code>${ctx.mainPrefix}help s</code>`,
       parseMode: "html"
     });
     return;
