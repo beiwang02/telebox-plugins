@@ -19211,7 +19211,7 @@ async function handleConfigCommand(ctx) {
     await ctx.msg.edit({ text: `\u2705 \u5DF2\u5220\u9664\u914D\u7F6E ${name}` });
     return true;
   }
-  await ctx.msg.edit({ text: ctx.helpText, parseMode: "html" });
+  await ctx.msg.edit({ text: `⚙️ 查看 API 配置：<code>${ctx.mainPrefix}s config list</code>\n完整用法：<code>${ctx.mainPrefix}h s</code>`, parseMode: "html" });
   return true;
 }
 
@@ -19236,10 +19236,7 @@ function buildHelpText(mainPrefix2) {
 • <code>${mainPrefix2}s add 6h --push me</code> - 创建时改为推送到收藏
 
 <b>🛠 任务管理:</b>
-• <code>${mainPrefix2}s tasks</code> - 查看任务
-• <code>${mainPrefix2}s tasks clear</code> - 清空当前群定时任务
-• <code>${mainPrefix2}s task &lt;ID&gt; run|off|on|del</code> - 运行/停用/启用/删除
-• <code>${mainPrefix2}s stop</code> - 停用当前群全部定时任务
+• <code>${mainPrefix2}s tasks</code> - 查看任务和管理指令
 
 <b>🤖 API 配置:</b>
 • <code>${mainPrefix2}s config list</code> - 查看 API 配置
@@ -25457,21 +25454,27 @@ async function handleTaskList(ctx) {
   const lines = [`\u{1F4CB} \u603B\u7ED3\u4EFB\u52A1 ${enabledCount}/${db.data.tasks.length} \u8FD0\u884C\u4E2D`];
   const sortedTasks = [...db.data.tasks].sort((left, right) => (parseInt(left.id, 10) || 0) - (parseInt(right.id, 10) || 0));
   for (const task of sortedTasks) {
-    const nextAt = cron2.sendAt(task.cron);
-    const nextDate = nextAt.toJSDate ? nextAt.toJSDate() : nextAt;
     const currentMark = task.chatId === currentChatId ? " \xB7 \u5F53\u524D\u7FA4" : "";
     const status = task.disabled ? "\u23F8" : "\u25B6\uFE0F";
     const range = task.timeRange ? formatLookbackLabel(task.timeRange) : `${task.messageCount} \u6761`;
     const provider = task.aiProvider || db.data.aiConfig.default_provider || "openai";
     const pushDisplay = task.pushTarget ? task.pushTarget === task.chatId ? task.chatDisplay || task.chatId : task.pushDisplay || task.pushTarget : db.data.defaultPushTarget || task.chatDisplay || task.chatId;
-    const nextText = task.disabled ? "\u5DF2\u7981\u7528" : formatDate(nextDate);
-    const resultText = task.lastError ? ` \xB7 \u274C ${truncateText(task.lastError, 28)}` : task.lastResult ? ` \xB7 \u2705 ${truncateText(task.lastResult, 28)}` : "";
+    const resultText = task.lastError ? `❌ ${truncateText(task.lastError, 28)}` : task.lastResult ? `✅ ${truncateText(task.lastResult, 28)}` : "";
     lines.push(`${status} <code>${task.id}</code> ${htmlEscape(truncateText(task.remark || task.chatDisplay || task.chatId, 24))}${currentMark}`);
     lines.push(`   ${htmlEscape(task.interval)} / ${htmlEscape(range)} \xB7 ${htmlEscape(provider)} \xB7 \u63A8\u9001 ${htmlEscape(truncateText(pushDisplay, 20))}`);
-    lines.push(`   \u4E0B\u6B21: ${htmlEscape(nextText)}${resultText ? htmlEscape(resultText) : ""}`);
+    if (!task.disabled) {
+      const nextAt = cron2.sendAt(task.cron);
+      const nextDate = nextAt.toJSDate ? nextAt.toJSDate() : nextAt;
+      lines.push(`   下次: ${htmlEscape(formatDate(nextDate))}${resultText ? ` · ${htmlEscape(resultText)}` : ""}`);
+    } else if (resultText) {
+      lines.push(`   ${htmlEscape(resultText)}`);
+    }
   }
   lines.push("");
-  lines.push(`\u7BA1\u7406: <code>${ctx.mainPrefix}s task &lt;ID&gt; run|off|on|del</code>`);
+  lines.push("🛠 <b>任务管理</b>");
+  lines.push(`<code>${ctx.mainPrefix}s task &lt;ID&gt; run|on|off|del</code> - 运行／启用／停用／删除指定任务`);
+  lines.push(`<code>${ctx.mainPrefix}s stop</code> - 停用当前群全部定时任务`);
+  lines.push(`<code>${ctx.mainPrefix}s tasks clear</code> - 清空所有群的定时任务`);
   await ctx.msg.edit({ text: lines.join("\n"), parseMode: "html" });
 }
 async function handleTaskClear(ctx) {
