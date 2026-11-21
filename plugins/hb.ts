@@ -69,83 +69,21 @@ export class HbPlugin extends Plugin {
     const bs = buttonsOf(msg);
     return bs.length === 1 && !!bs[0].data?.length;
   }
-  private boosts = new Map<string, { until: number; started: number; epoch: number; minId: number; attempts: number; timer?: ReturnType<typeof setTimeout> }>();
-  private lastPoll = 0;
-  private polling = false;
-  private queryTimes: number[] = [];
   private floodUntil = 0;
   private isPaused() { return Date.now() < Math.max(this.floodUntil, this.state.pausedUntil); }
   private arrivals = new WeakMap<Api.Message, number>();
-  private pollOrigins = new WeakMap<Api.Message, { until: number; epoch: number }>();
-  private stopBoost(chat: string) { const w = this.boosts.get(chat); if (w?.timer) clearTimeout(w.timer); this.boosts.delete(chat); }
-  private stopAllBoosts() { for (const chat of this.boosts.keys()) this.stopBoost(chat); }
-  /** 普通消息只走推送；/red 或可信 Bot 的准备提示才开启有界查询，重复触发不延长。 */
-  private triggerBoost(msg: Api.Message) {
-    if (!this.live() || !msg.isGroup || !msg.chatId || msg.fwdFrom || msg.viaBotId || this.isPaused()) return;
+  /** 只用已收到的 Bot 准备消息辅助识别，不请求群历史。 */
+  private rememberPreparation(msg: Api.Message) {
+    if (!this.live() || !msg.isGroup || !msg.chatId || !msg.senderId || msg.out || msg.fwdFrom || msg.viaBotId || this.isPaused()) return;
+    if (!(msg.fromId instanceof Api.PeerUser) || !/正在准备红包|正在準備紅包/.test(msg.message || "")) return;
     const age = Date.now() / 1000 - Number(msg.date);
     if (!Number.isFinite(age) || age < -10 || age > 15) return;
-    const rules = Object.values(this.state.rules).filter(r => r.enabled && r.owner === this.owner && Number(msg.date) >= r.since);
-    if (!rules.length) return;
-    const text = msg.message || "";
-    const command = text.match(/^\/red(?:@([a-zA-Z0-9_]+))?(?:\s|$)/i);
-    const red = command && (!command[1] || rules.some(r => r.label.toLowerCase() === `@${command[1].toLowerCase()}`));
-    const preparing = msg.fromId instanceof Api.PeerUser && rules.some(r => r.bot === msg.senderId?.toString()) && /正在准备红包|正在準備紅包/.test(text);
-    if (preparing) {
-      const key = msg.chatId.toString();
-      if (this.preparations.size >= 100) for (const [k, v] of this.preparations) if (Date.now() - v.at > 15000) this.preparations.delete(k);
-      if (this.preparations.size < 100 || this.preparations.has(key)) this.preparations.set(key, { bot: msg.senderId!.toString(), at: Date.now(), id: msg.id });
-    }
-    if (!red && !preparing) return;
-    const chat = msg.chatId.toString();
-    if (this.boosts.has(chat) || this.boosts.size >= 4) return;
-    const window = { until: Date.now() + 8000, started: Date.now(), epoch: this.epoch, minId: msg.id - 1, attempts: 0 };
-    this.boosts.set(chat, window);
-    void this.pollBoost(msg, window);
-  }
-  /** 备用查询全局间隔至少 2 秒，每分钟最多 6 次，每窗口最多 2 次。 */
-  private async pollBoost(seed: Api.Message, w: { until: number; started: number; epoch: number; minId: number; attempts: number; timer?: ReturnType<typeof setTimeout> }) {
-    const chat = seed.chatId!.toString();
-    const valid = () => this.live() && this.boosts.get(chat) === w && w.epoch === this.epoch && Date.now() < w.until && !this.isPaused();
-    if (!valid()) { if (this.boosts.get(chat) === w) this.stopBoost(chat); return; }
-    const now = Date.now();
-    this.queryTimes = this.queryTimes.filter(t => now - t < 60_000);
-    if (w.attempts >= 2 || this.queryTimes.length >= 6) { this.stopBoost(chat); return; }
-    const delay = Math.max(this.polling ? 200 : 0, 2000 - (now - this.lastPoll));
-    if (delay > 0) {
-      if (now + delay < w.until) w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, delay);
-      else this.stopBoost(chat);
-      return;
-    }
-    this.polling = true;
-    this.lastPoll = now;
-    this.queryTimes.push(now);
-    w.attempts++;
-    try {
-      // 查询最新10条兼容“准备消息原地编辑”和“另发红包”两种路径，不扫描历史。
-      const messages = await seed.client!.getMessages(seed.peerId, { limit: 10 });
-      if (!valid()) return;
-      for (const m of messages) {
-        if (!valid()) break;
-        if (m instanceof Api.Message && m.id > w.minId && this.matches(m)) {
-          this.arrivals.set(m, Date.now());
-          this.pollOrigins.set(m, w);
-          await this.listenMessageHandler(m);
-        }
-      }
-    } catch (e) {
-      const err = e as { seconds?: number; errorMessage?: string; message?: string };
-      const wait = Number(err.seconds) || Number(String(err.errorMessage || err.message || "").match(/(?:FLOOD|SLOWMODE)_WAIT[_ ](\d+)/)?.[1]);
-      if (wait > 0 && Number.isFinite(wait)) {
-        this.floodUntil = Math.max(this.floodUntil, Date.now() + (wait + 1) * 1000);
-        this.stopAllBoosts();
-        await this.persistFlood();
-        this.recent = "加速查询触发限流，已停止全部窗口并暂停";
-      } else { this.stopBoost(chat); this.recent = "加速查询失败，结束本轮；仍保留实时推送监听"; }
-    } finally {
-      this.polling = false;
-      if (valid() && w.attempts < 2) w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, 2000);
-      else if (this.boosts.get(chat) === w) this.stopBoost(chat);
-    }
+    const bot = msg.senderId.toString();
+    const rule = this.state.rules[bot];
+    if (!rule?.enabled || rule.bot !== bot || rule.owner !== this.owner || Number(msg.date) < rule.since) return;
+    const key = msg.chatId.toString();
+    if (this.preparations.size >= 100) for (const [k, v] of this.preparations) if (Date.now() - v.at > 15000) this.preparations.delete(k);
+    if (this.preparations.size < 100 || this.preparations.has(key)) this.preparations.set(key, { bot, at: Date.now(), id: msg.id });
   }
   private live() { return this.active && !this.signal?.aborted; }
   /** 状态变更与去重占位串行执行，网络回调在队列外等待。 */
@@ -169,9 +107,8 @@ export class HbPlugin extends Plugin {
       else this.state = s;
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw Error("hb 状态文件无效，拒绝覆盖"); }
     this.active = true;
-    this.signal?.addEventListener("abort", () => this.stopAllBoosts(), { once: true });
   }
-  async cleanup() { this.active = false; this.stopAllBoosts(); await this.tail; }
+  async cleanup() { this.active = false; await this.tail; }
   /** 同目录临时文件 + rename 原子替换；写入失败时绝不继续提交领取回调。 */
   private async save(next: State) {
     const tmp = path.join(root, `.${randomUUID()}.tmp`);
@@ -194,7 +131,7 @@ export class HbPlugin extends Plugin {
   /** 新建与编辑走相同流水线；队列最多保留 20 个任务，积压时丢弃而非突发补抢。 */
   listenMessageHandler = async (msg: Api.Message) => {
     if (!this.arrivals.has(msg)) this.arrivals.set(msg, Date.now());
-    this.triggerBoost(msg);
+    this.rememberPreparation(msg);
     if (!this.matches(msg) || this.queued >= 20) return;
     this.queued++;
     try { await this.receive(msg); }
@@ -203,14 +140,12 @@ export class HbPlugin extends Plugin {
   };
   private async receive(msg: Api.Message) {
     const epoch = this.epoch;
-    const origin = this.pollOrigins.get(msg);
-    const currentOrigin = () => !origin || (this.boosts.get(msg.chatId!.toString()) === origin && origin.epoch === this.epoch && Date.now() < origin.until);
     const key = `${msg.chatId}:${msg.id}`;
     const client = msg.client;
     if (!client) return;
     const data = await this.serial(async () => {
       const rule = this.matches(msg);
-      if (!rule || epoch !== this.epoch || this.state.seen[key] || this.isPaused() || !currentOrigin()) return;
+      if (!rule || epoch !== this.epoch || this.state.seen[key] || this.isPaused()) return;
       const choices = buttonsOf(msg).filter(b => b.data?.length && (rule.buttons.length ? rule.buttons.includes(b.text) : claimLabel(b.text) || this.contextualClaim(msg)));
       if (choices.length !== 1) return;
       const next = this.copy();
@@ -222,22 +157,18 @@ export class HbPlugin extends Plugin {
       await this.save(next);
       return choices[0].data;
     });
-    if (!data || !this.matches(msg) || epoch !== this.epoch || this.isPaused() || !currentOrigin()) return;
+    if (!data || !this.matches(msg) || epoch !== this.epoch || this.isPaused()) return;
     const submittedAt = Date.now();
-    const window = this.boosts.get(msg.chatId!.toString());
     const localMs = submittedAt - (this.arrivals.get(msg) || submittedAt);
-    const windowMs = window ? submittedAt - window.started : undefined;
-    this.stopBoost(msg.chatId!.toString());
     try {
       await client.invoke(new Api.messages.GetBotCallbackAnswer({ peer: msg.peerId, msgId: msg.id, data }));
-      this.recent = `回调已返回，本地提交 ${localMs}ms${windowMs === undefined ? "" : `，触发至提交 ${windowMs}ms`}，RPC ${Date.now() - submittedAt}ms（不代表红包领取成功）`;
+      this.recent = `回调已返回，本地提交 ${localMs}ms，RPC ${Date.now() - submittedAt}ms（不代表红包领取成功）`;
     } catch (e) {
       const err = e as { seconds?: number; errorMessage?: string; message?: string };
       const label = String(err.errorMessage || err.message || "");
       const wait = Number(err.seconds) || Number(label.match(/(?:FLOOD|SLOWMODE)_WAIT[_ ](\d+)/)?.[1]);
       if (wait > 0 && Number.isFinite(wait)) {
         this.floodUntil = Math.max(this.floodUntil, Date.now() + (wait + 1) * 1000);
-        this.stopAllBoosts();
         await this.persistFlood();
         this.recent = "Telegram 限流，已暂停；该红包不重试";
       } else this.recent = "回调失败或结果未知，已去重，不自动重试";
@@ -271,7 +202,7 @@ export class HbPlugin extends Plugin {
       await msg.edit({ text: prompt, parseMode: "html" });
       return;
     }
-    if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); this.preparations.clear(); }
+    if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.preparations.clear(); }
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
       if (command === "bind" && username) {
