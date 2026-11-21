@@ -46,12 +46,16 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `<b>🧧 自动抢红包</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} on [编号]</code> - 开启绑定\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
+  return `<b>🧧 抢红包助手</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} on [编号]</code> - 开启绑定\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
 };
 
 export class HbPlugin extends Plugin {
   name = "hb";
-  description = help;
+  description = () => {
+    const c = esc(`${getPrefixes()[0] || "."}hb`);
+    return `<b>🧧 抢红包助手</b>
+发送 <code>${c}</code> 查看完整用法。`;
+  };
   listenMessageHandlerIgnoreEdited = false;
   private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
@@ -69,16 +73,19 @@ export class HbPlugin extends Plugin {
     const bs = buttonsOf(msg);
     return bs.length === 1 && !!bs[0].data?.length;
   }
-  private boosts = new Map<string, { until: number; started: number; epoch: number; minId: number; timer?: ReturnType<typeof setTimeout> }>();
+  private boosts = new Map<string, { until: number; started: number; epoch: number; minId: number; attempts: number; timer?: ReturnType<typeof setTimeout> }>();
   private lastPoll = 0;
   private polling = false;
+  private queryTimes: number[] = [];
+  private floodUntil = 0;
+  private isPaused() { return Date.now() < Math.max(this.floodUntil, this.state.pausedUntil); }
   private arrivals = new WeakMap<Api.Message, number>();
   private pollOrigins = new WeakMap<Api.Message, { until: number; epoch: number }>();
   private stopBoost(chat: string) { const w = this.boosts.get(chat); if (w?.timer) clearTimeout(w.timer); this.boosts.delete(chat); }
   private stopAllBoosts() { for (const chat of this.boosts.keys()) this.stopBoost(chat); }
   /** 普通消息只走推送；/red 或可信 Bot 的准备提示才开启有界查询，重复触发不延长。 */
   private triggerBoost(msg: Api.Message) {
-    if (!this.live() || !msg.isGroup || !msg.chatId || msg.fwdFrom || msg.viaBotId || Date.now() < this.state.pausedUntil) return;
+    if (!this.live() || !msg.isGroup || !msg.chatId || msg.fwdFrom || msg.viaBotId || this.isPaused()) return;
     const age = Date.now() / 1000 - Number(msg.date);
     if (!Number.isFinite(age) || age < -10 || age > 15) return;
     const rules = Object.values(this.state.rules).filter(r => r.enabled && r.owner === this.owner && Number(msg.date) >= r.since);
@@ -95,17 +102,28 @@ export class HbPlugin extends Plugin {
     if (!red && !preparing) return;
     const chat = msg.chatId.toString();
     if (this.boosts.has(chat) || this.boosts.size >= 4) return;
-    const window = { until: Date.now() + 8000, started: Date.now(), epoch: this.epoch, minId: msg.id - 1 };
+    const window = { until: Date.now() + 8000, started: Date.now(), epoch: this.epoch, minId: msg.id - 1, attempts: 0 };
     this.boosts.set(chat, window);
     void this.pollBoost(msg, window);
   }
-  /** 账号全局最多每500ms一次查询、仅一个在途查询；多群窗口共享额度，不无限并发。 */
-  private async pollBoost(seed: Api.Message, w: { until: number; started: number; epoch: number; minId: number; timer?: ReturnType<typeof setTimeout> }) {
+  /** 备用查询全局间隔至少 2 秒，每分钟最多 6 次，每窗口最多 2 次。 */
+  private async pollBoost(seed: Api.Message, w: { until: number; started: number; epoch: number; minId: number; attempts: number; timer?: ReturnType<typeof setTimeout> }) {
     const chat = seed.chatId!.toString();
-    const valid = () => this.live() && this.boosts.get(chat) === w && w.epoch === this.epoch && Date.now() < w.until && Date.now() >= this.state.pausedUntil;
+    const valid = () => this.live() && this.boosts.get(chat) === w && w.epoch === this.epoch && Date.now() < w.until && !this.isPaused();
     if (!valid()) { if (this.boosts.get(chat) === w) this.stopBoost(chat); return; }
-    if (this.polling || Date.now() - this.lastPoll < 500) { w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, 100); return; }
-    this.polling = true; this.lastPoll = Date.now();
+    const now = Date.now();
+    this.queryTimes = this.queryTimes.filter(t => now - t < 60_000);
+    if (w.attempts >= 2 || this.queryTimes.length >= 6) { this.stopBoost(chat); return; }
+    const delay = Math.max(this.polling ? 200 : 0, 2000 - (now - this.lastPoll));
+    if (delay > 0) {
+      if (now + delay < w.until) w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, delay);
+      else this.stopBoost(chat);
+      return;
+    }
+    this.polling = true;
+    this.lastPoll = now;
+    this.queryTimes.push(now);
+    w.attempts++;
     try {
       // 查询最新10条兼容“准备消息原地编辑”和“另发红包”两种路径，不扫描历史。
       const messages = await seed.client!.getMessages(seed.peerId, { limit: 10 });
@@ -122,19 +140,19 @@ export class HbPlugin extends Plugin {
       const err = e as { seconds?: number; errorMessage?: string; message?: string };
       const wait = Number(err.seconds) || Number(String(err.errorMessage || err.message || "").match(/(?:FLOOD|SLOWMODE)_WAIT[_ ](\d+)/)?.[1]);
       if (wait > 0 && Number.isFinite(wait)) {
-        this.state.pausedUntil = Math.max(this.state.pausedUntil, Date.now() + Math.min(wait + 1, 365 * 86400) * 1000);
+        this.floodUntil = Math.max(this.floodUntil, Date.now() + (wait + 1) * 1000);
         this.stopAllBoosts();
-        await this.serial(async () => { await this.save(this.copy()); }).catch(() => undefined);
+        await this.persistFlood();
         this.recent = "加速查询触发限流，已停止全部窗口并暂停";
       } else { this.stopBoost(chat); this.recent = "加速查询失败，结束本轮；仍保留实时推送监听"; }
     } finally {
       this.polling = false;
-      if (valid()) w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, 500);
+      if (valid() && w.attempts < 2) w.timer = setTimeout(() => { void this.pollBoost(seed, w); }, 2000);
       else if (this.boosts.get(chat) === w) this.stopBoost(chat);
     }
   }
   private live() { return this.active && !this.signal?.aborted; }
-  /** 所有状态变更与领取串行执行，避免新消息和编辑事件同时通过去重检查。 */
+  /** 状态变更与去重占位串行执行，网络回调在队列外等待。 */
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.tail.then(fn); this.tail = result.catch(() => undefined); return result;
   }
@@ -183,8 +201,7 @@ export class HbPlugin extends Plugin {
     this.triggerBoost(msg);
     if (!this.matches(msg) || this.queued >= 20) return;
     this.queued++;
-    const epoch = this.epoch;
-    try { await this.serial(async () => { if (epoch === this.epoch) await this.receive(msg); }); }
+    try { await this.receive(msg); }
     catch { this.recent = "本地存储或处理异常，未自动重试"; console.error("[hb] processing-failed"); }
     finally { this.queued--; }
   };
@@ -192,47 +209,50 @@ export class HbPlugin extends Plugin {
     const epoch = this.epoch;
     const origin = this.pollOrigins.get(msg);
     const currentOrigin = () => !origin || (this.boosts.get(msg.chatId!.toString()) === origin && origin.epoch === this.epoch && Date.now() < origin.until);
-    if (!currentOrigin()) return;
     const key = `${msg.chatId}:${msg.id}`;
-    if (!this.matches(msg) || this.state.seen[key] || Date.now() < this.state.pausedUntil || !msg.client) return;
-    // 快速路径：新建/编辑事件已有完整身份和键盘，直接使用，不额外 getMessages。
-    // 取舍：红包可能在事件到达后已结束，交给 Bot 回调处理；不为刷新再付一次网络 RTT。
-    // 缺失身份或键盘的残缺更新直接跳过，不根据猜测提交。
-    const fresh = msg;
-    const r = this.matches(fresh);
-    if (!r || this.state.seen[key]) return;
-    const choices = buttonsOf(fresh).filter(b => b.data?.length && (r.buttons.length ? r.buttons.includes(b.text) : claimLabel(b.text) || this.contextualClaim(fresh)));
-    if (choices.length !== 1 || !this.live() || epoch !== this.epoch) return;
-    const next = this.copy(); const now = Date.now();
-    next.seen = Object.fromEntries(Object.entries(next.seen).filter(([, ts]) => now - ts < 7 * 86400000));
-    // 不为腾空间驱逐近期记录；达到上限则停止提交，避免同一红包重新触发。
-    if (Object.keys(next.seen).length >= 10000) { this.recent = "去重记录已达上限，暂停提交"; return; }
-    next.seen[key] = now;
-    // 去重键不含按钮 data 或编辑版本，防止 Bot 改按钮后重复领取。
-    // 先持久化占位再发 RPC：崩溃可能造成漏领，但不会因重启主动重放未知结果。
-    await this.save(next);
-    if (!this.live() || !this.matches(fresh) || epoch !== this.epoch || !currentOrigin() || Date.now() < this.state.pausedUntil) return;
+    const client = msg.client;
+    if (!client) return;
+    const data = await this.serial(async () => {
+      const rule = this.matches(msg);
+      if (!rule || epoch !== this.epoch || this.state.seen[key] || this.isPaused() || !currentOrigin()) return;
+      const choices = buttonsOf(msg).filter(b => b.data?.length && (rule.buttons.length ? rule.buttons.includes(b.text) : claimLabel(b.text) || this.contextualClaim(msg)));
+      if (choices.length !== 1) return;
+      const next = this.copy();
+      const now = Date.now();
+      next.seen = Object.fromEntries(Object.entries(next.seen).filter(([, ts]) => now - ts < 7 * 86400000));
+      if (Object.keys(next.seen).length >= 10000) { this.recent = "去重记录已达上限，暂停提交"; return; }
+      // 同一消息先持久化占位，重启时也不会重放结果未知的回调。
+      next.seen[key] = now;
+      await this.save(next);
+      return choices[0].data;
+    });
+    if (!data || !this.matches(msg) || epoch !== this.epoch || this.isPaused() || !currentOrigin()) return;
     const submittedAt = Date.now();
     const window = this.boosts.get(msg.chatId!.toString());
     const localMs = submittedAt - (this.arrivals.get(msg) || submittedAt);
     const windowMs = window ? submittedAt - window.started : undefined;
     this.stopBoost(msg.chatId!.toString());
     try {
-      await msg.client.invoke(new Api.messages.GetBotCallbackAnswer({ peer: fresh.peerId, msgId: fresh.id, data: choices[0].data! }));
+      await client.invoke(new Api.messages.GetBotCallbackAnswer({ peer: msg.peerId, msgId: msg.id, data }));
       this.recent = `回调已返回，本地提交 ${localMs}ms${windowMs === undefined ? "" : `，触发至提交 ${windowMs}ms`}，RPC ${Date.now() - submittedAt}ms（不代表红包领取成功）`;
     } catch (e) {
       const err = e as { seconds?: number; errorMessage?: string; message?: string };
       const label = String(err.errorMessage || err.message || "");
       const wait = Number(err.seconds) || Number(label.match(/(?:FLOOD|SLOWMODE)_WAIT[_ ](\d+)/)?.[1]);
       if (wait > 0 && Number.isFinite(wait)) {
-        const paused = this.copy(); paused.pausedUntil = Math.max(paused.pausedUntil, Date.now() + Math.min(wait + 1, 365 * 86400) * 1000);
+        this.floodUntil = Math.max(this.floodUntil, Date.now() + (wait + 1) * 1000);
         this.stopAllBoosts();
-        // 限流作用于整个账号的本插件；即使落盘失败，当前进程仍保留暂停状态。
-        this.state.pausedUntil = paused.pausedUntil;
-        await this.save(paused);
+        await this.persistFlood();
         this.recent = "Telegram 限流，已暂停；该红包不重试";
       } else this.recent = "回调失败或结果未知，已去重，不自动重试";
     }
+  }
+  private async persistFlood() {
+    await this.serial(async () => {
+      const next = this.copy();
+      next.pausedUntil = Math.max(next.pausedUntil, this.floodUntil);
+      await this.save(next);
+    }).catch(() => console.error("[hb] flood-state-save-failed"));
   }
   /** 管理命令在群聊、私聊、收藏夹均可执行；只有账号本人有权修改全局绑定。 */
   cmdHandlers = { hb: async (msg: Api.Message) => {
@@ -245,8 +265,7 @@ export class HbPlugin extends Plugin {
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
       if (command === "usage") {
-        const p = esc(getPrefixes()[0] || ".");
-        await respond(`用法：<code>${p}hb bind &lt;@机器人&gt;</code> 绑定并开启\n管理：<code>${p}hb list</code>\n详细帮助：<code>${p}h hb</code>`); return;
+        await respond(help()); return;
       }
       if (command === "bind") {
         const username = args.shift();
@@ -270,7 +289,7 @@ export class HbPlugin extends Plugin {
       const c = esc(`${getPrefixes()[0] || "."}hb`);
       if (["status", "list"].includes(command)) {
         const rows = entries.map(([, r], i) => `${i + 1}. ${esc(r.label)} · ${r.enabled ? "🟢 开启" : "⏸ 已暂停"}`).join("\n");
-        await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} on [编号]</code> - 开启绑定\n<code>${c} off [编号]</code> - 暂停绑定\n<code>${c} del [编号]</code> - 删除绑定\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((this.state.pausedUntil - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
+        await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} on [编号]</code> - 开启绑定\n<code>${c} off [编号]</code> - 暂停绑定\n<code>${c} del [编号]</code> - 删除绑定\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((Math.max(this.state.pausedUntil, this.floodUntil) - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
       }
       if (!["on", "off", "unbind"].includes(command)) { await respond(help()); return; }
       if (!entries.length) { await respond("尚未绑定 Bot，请发送 hb bind @机器人用户名。"); return; }

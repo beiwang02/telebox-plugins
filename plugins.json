@@ -25,6 +25,6 @@
   },
   "hb": {
     "url": "https://raw.githubusercontent.com/beiwang02/telebox-plugins/main/plugins/hb.ts",
-    "desc": "绑定指定 Bot 的回调红包自动领取，支持新消息和编辑、防重复及限流暂停"
+    "desc": "抢红包助手"
   }
 }
