@@ -51,11 +51,7 @@ const help = () => {
 
 export class HbPlugin extends Plugin {
   name = "hb";
-  description = () => {
-    const c = esc(`${getPrefixes()[0] || "."}hb`);
-    return `<b>🧧 抢红包助手</b>
-发送 <code>${c}</code> 查看完整用法。`;
-  };
+  description = "抢红包助手";
   listenMessageHandlerIgnoreEdited = false;
   private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
