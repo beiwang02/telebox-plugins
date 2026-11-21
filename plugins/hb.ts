@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 /**
  * hb — TeleBox Classic 0.2.9 定向抢红包插件。
  *
- * 使用：在任意聊天执行 `.hb bind @bot`，绑定后直接开启。
+ * 使用：在任意聊天执行 `.hb @bot`，绑定后直接开启。
  * 按真实 Bot ID 全局匹配，不受管理命令发送位置影响；数据在 assets/hb/state.json。
  *
  * 安全边界：只提交明确选定的 callback，不打开链接、WebApp、支付或授权页面。
@@ -46,12 +46,12 @@ export function buttonsOf(msg: Api.Message): Button[] {
 }
 const help = () => {
   const c = esc(`${getPrefixes()[0] || "."}hb`);
-  return `<b>🧧 抢红包助手</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} bind &lt;@机器人&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} on [编号]</code> - 开启绑定\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
+  return `<b>🧧 抢红包助手</b>\n\n<b>🤖 机器人绑定:</b>\n• <code>${c} &lt;@机器人用户名&gt;</code> - 添加并立即开启\n\n<b>🛠 绑定管理:</b>\n• <code>${c} list</code> - 查看绑定编号与状态\n• <code>${c} on [编号]</code> - 开启绑定\n• <code>${c} off [编号]</code> - 暂停绑定\n• <code>${c} del [编号]</code> - 删除绑定\n未填编号时操作全部，编号以最新列表为准。\n\n<b>📋 回调查看:</b>\n• <code>${c} status</code> - 查看最近回调结果与耗时\n最近回调不是完整历史，也不代表已到账。\n\n群聊、私聊、收藏夹均可管理，绑定全局生效。`;
 };
 
 export class HbPlugin extends Plugin {
   name = "hb";
-  description = "抢红包助手";
+  description = help;
   listenMessageHandlerIgnoreEdited = false;
   private state: State = { version: 2, rules: {}, seen: {}, pausedUntil: 0 };
   private tail: Promise<unknown> = Promise.resolve();
@@ -255,17 +255,26 @@ export class HbPlugin extends Plugin {
     const me = await msg.client?.getMe();
     if (!me || !msg.out || msg.senderId?.toString() !== me.id.toString() || !this.live()) return;
     const args = (msg.message || "").trim().split(/\s+/).slice(1);
-    const rawCommand = args.shift() || "usage";
-    const command = ({ pause: "off", resume: "on", del: "unbind" } as Record<string, string>)[rawCommand] || rawCommand;
+    const c = esc(`${getPrefixes()[0] || "."}hb`);
+    const prompt = `请输入机器人用户名：<code>${c} &lt;@机器人用户名&gt;</code>`;
+    const first = args.shift();
+    if (!first) {
+      await msg.edit({ text: prompt, parseMode: "html" });
+      return;
+    }
+    const aliases = new Map([["pause", "off"], ["resume", "on"], ["del", "unbind"]]);
+    const sub = aliases.get(first) ?? first;
+    const command = ["bind", "off", "on", "unbind", "list", "status", "inspect"].includes(sub) ? sub : "bind";
+    // 普通参数直接视作 Bot 用户名；保留旧 bind 写法兼容已有用法。
+    const username = command === "bind" ? (first === "bind" ? args.shift() : first) : undefined;
+    if (command === "bind" && (!username || !/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(username))) {
+      await msg.edit({ text: prompt, parseMode: "html" });
+      return;
+    }
     if (["bind", "off", "unbind"].includes(command)) { this.epoch++; this.stopAllBoosts(); this.preparations.clear(); }
     await this.serial(async () => {
       const respond = (text: string) => msg.edit({ text, parseMode: "html" });
-      if (command === "usage") {
-        await respond(help()); return;
-      }
-      if (command === "bind") {
-        const username = args.shift();
-        if (!username || !/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(username)) { await respond("用法：<code>hb bind @机器人用户名</code>，无需回复红包；群聊、私聊和收藏夹均可操作。"); return; }
+      if (command === "bind" && username) {
         let bot;
         try { bot = await msg.client!.getEntity(username.startsWith("@") ? username : `@${username}`); }
         catch { await respond("无法解析这个用户名，原绑定未改变。请确认 Bot 用户名有效。"); return; }
@@ -278,17 +287,16 @@ export class HbPlugin extends Plugin {
       }
       if (command === "inspect") {
         const target = await msg.getReplyMessage();
-        if (!(target instanceof Api.Message)) { await respond("inspect 需要回复一条消息；bind 不需要回复，直接 hb bind @bot。"); return; }
+        if (!(target instanceof Api.Message)) { await respond("inspect 需要回复一条消息；绑定不需要回复。"); return; }
         await respond(buttonsOf(target).slice(0, 20).map(b => `${esc(b.text.slice(0, 100))} — ${esc(b.kind)}（${b.data ? "回调" : "不执行"}）`).join("\n") || "没有 inline 按钮；未执行任何点击。"); return;
       }
       const entries = Object.entries(this.state.rules).filter(([, r]) => r.owner === me.id.toString()).sort(([a], [b]) => a.localeCompare(b));
-      const c = esc(`${getPrefixes()[0] || "."}hb`);
       if (["status", "list"].includes(command)) {
         const rows = entries.map(([, r], i) => `${i + 1}. ${esc(r.label)} · ${r.enabled ? "🟢 开启" : "⏸ 已暂停"}`).join("\n");
         await respond(`🧧 <b>红包管理</b>\n${rows || "暂无绑定"}\n\n<code>${c} on [编号]</code> - 开启绑定\n<code>${c} off [编号]</code> - 暂停绑定\n<code>${c} del [编号]</code> - 删除绑定\n编号以最新 list 为准；不带编号则操作全部。\n\n限流等待：${Math.max(0, Math.ceil((Math.max(this.state.pausedUntil, this.floodUntil) - Date.now()) / 1000))} 秒\n最近回调：${esc(this.recent)}\n（只显示本次加载后的最近结果，不是历史或到账证明）`); return;
       }
       if (!["on", "off", "unbind"].includes(command)) { await respond(help()); return; }
-      if (!entries.length) { await respond("尚未绑定 Bot，请发送 hb bind @机器人用户名。"); return; }
+      if (!entries.length) { await respond(`尚未绑定 Bot。${prompt}`); return; }
       const selector = args.shift();
       let selected = entries;
       if (selector) {
